@@ -1,0 +1,6 @@
+assets/
+logs/
+BERT_model/
+error_distribution_plot/
+.vscode
+wandb/
