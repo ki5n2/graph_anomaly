@@ -383,7 +383,6 @@ wandb.config = {
 }
 
 
-
 # %%
 '''MODEL CONSTRUCTION'''
 class ResidualBlock(nn.Module):
@@ -938,6 +937,18 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
             
             all_results.append((auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly))
             print(f'Epoch {epoch+1}: Training Loss = {train_loss:.4f}, Validation loss = {test_loss:.4f}, Validation loss anomaly = {test_loss_anomaly:.4f}, Validation AUC = {auroc:.4f}, Validation AUPRC = {auprc:.4f}, Precision = {precision:.4f}, Recall = {recall:.4f}, F1 = {f1:.4f}')
+            wandb.log({
+                "epoch": epoch,
+                "train_loss": train_loss,
+                "val_loss": test_loss,
+                "val_loss_anomaly": test_loss_anomaly,
+                "auroc": auroc,
+                "auprc": auprc,
+                "precision": precision,
+                "recall": recall,
+                "f1": f1,
+                "learning_rate": recon_optimizer.param_groups[0]['lr']
+            })
             
             info_test = 'AD_AUC:{:.4f}, AD_AUPRC:{:.4f}, Test_Loss:{:.4f}, Test_Loss_Anomaly:{:.4f}'.format(auroc, auprc, test_loss, test_loss_anomaly)
             print(info_train + '   ' + info_test)
@@ -1057,5 +1068,8 @@ for trial in range(n_cross_val):
             # 저장하거나 보여주기
             plt.savefig(f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}/error_distribution_plot_epoch_{epoch}_fold_{trial}.png')  # 파일로 저장
             plt.show()  # 직접 보기
+
+
+wandb.finish()
 
 # %%
