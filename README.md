@@ -1,1 +1,1 @@
-graph_anomaly
+A repository for experimenting with anomaly detection for graphs.

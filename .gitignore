@@ -4,3 +4,6 @@ BERT_model/
 error_distribution_plot/
 .vscode
 wandb/
+run_src.sh
+multi_link_run.sh
+multi_run.sh
