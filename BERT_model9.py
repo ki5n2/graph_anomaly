@@ -485,7 +485,7 @@ class BilinearEdgeDecoder(nn.Module):
     
 #%%
 class BertEncoder(nn.Module):
-    def __init__(self, num_features, hidden_dims, d_model, nhead, num_layers, max_nodes, num_node_classes, dropout_rate=0.1):
+    def __init__(self, num_features, hidden_dims, d_model, nhead, num_layers, max_nodes, dropout_rate=0.1):
         super().__init__()
         self.gcn_encoder = Encoder(num_features, hidden_dims, dropout_rate)
         self.positional_encoding = GraphBertPositionalEncoding(hidden_dims[-1], max_nodes)
@@ -759,7 +759,7 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters):
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
 class GRAPH_AUTOENCODER(nn.Module):
-    def __init__(self, num_features, hidden_dims, max_nodes, nhead, num_layers, num_node_labels, dropout_rate=0.1):
+    def __init__(self, num_features, hidden_dims, max_nodes, nhead, num_layers, dropout_rate=0.1):
         super().__init__()
         self.encoder = BertEncoder(
             num_features=num_features,
@@ -768,7 +768,6 @@ class GRAPH_AUTOENCODER(nn.Module):
             nhead=nhead,
             num_layers=num_layers,
             max_nodes=max_nodes,
-            num_node_classes=num_node_labels,
             dropout_rate=dropout_rate
         )
         self.transformer_d = TransformerEncoder(
@@ -860,7 +859,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     max_node_label = meta['max_node_label']
     
     # BERT 모델 저장 경로
-    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
+    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
     
     model = GRAPH_AUTOENCODER(
         num_features=num_features, 
@@ -868,7 +867,6 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         max_nodes=max_nodes,
         nhead=n_head,
         num_layers=n_layer,
-        num_node_labels=max_node_label,
         dropout_rate=dropout_rate
     ).to(device)
     
@@ -902,14 +900,14 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
             if epoch % log_interval == 0:
                 print(f'BERT Training Epoch {epoch}: Loss = {train_loss:.4f}')
         
-        for epoch in range(1, BERT_epochs+1):
-            train_adj_loss, num_sample_ = train_bert_embedding_(
-                model, train_loader, bert_optimizer, device
-            )
-            # bert_scheduler.step(train_loss)
+        # for epoch in range(1, BERT_epochs+1):
+        #     train_adj_loss, num_sample_ = train_bert_embedding_(
+        #         model, train_loader, bert_optimizer, device
+        #     )
+        #     # bert_scheduler.step(train_loss)
             
-            if epoch % log_interval == 0:
-                print(f'BERT Edge Training Epoch {epoch}: Loss = {train_adj_loss:.4f}')
+        #     if epoch % log_interval == 0:
+        #         print(f'BERT Edge Training Epoch {epoch}: Loss = {train_adj_loss:.4f}')
                       
         # 학습된 BERT 저장
         print("Saving pretrained BERT...")
@@ -1027,7 +1025,7 @@ if __name__ == '__main__':
     print(f"Total execution time: {total_time:.2f} seconds")
     
     # 모든 결과를 JSON으로 저장
-    results_path = f'/root/default/GRAPH_ANOMALY_DETECTION/graph_anomaly_detection/cross_val_results/epoch_results.json'
+    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.json'
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
     with open(results_path, 'w') as f:
         json.dump({
