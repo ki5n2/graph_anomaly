@@ -233,9 +233,9 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
                 })
                 
                 # 전체 에러는 정규화된 값들의 평균으로 계산
-                total_error = (normalized_node_loss + normalized_cluster_dist) / 2
-                print(f'normalized node loss: {normalized_node_loss/2}')
-                print(f'normalized cluster dist: {normalized_cluster_dist/2}')
+                total_error = (normalized_node_loss * 10) + (normalized_cluster_dist * 5)
+                print(f'normalized node loss: {normalized_node_loss * 10}')
+                print(f'normalized cluster dist: {normalized_cluster_dist * 5}')
                 recon_errors.append(total_error)
                 
                 if data.y[i].item() == 0:
@@ -262,9 +262,6 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
         ]
     }
     
-    total_loss_mean = total_loss_ / sum(all_labels == 0)
-    total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-    
     # 메트릭 계산
     all_labels = np.array(all_labels)
     all_scores = np.array(all_scores)
@@ -282,6 +279,9 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     precision = precision_score(all_labels, pred_labels)
     recall = recall_score(all_labels, pred_labels)
     f1 = f1_score(all_labels, pred_labels)
+    
+    total_loss_mean = total_loss_ / sum(all_labels == 0)
+    total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
     
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
 

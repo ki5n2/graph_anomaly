@@ -388,10 +388,10 @@ def get_data_loaders_TU(dataset_name, batch_size, test_batch_size, split, datase
         new_x = torch.tensor(node_attrs[node_idx:node_idx+num_nodes], dtype=torch.float)
         node_label_graph = torch.tensor(node_labels[node_idx:node_idx+num_nodes], dtype=torch.float)   
 
-        if new_x.shape[0] == node_label_graph.shape[0]:
-            print(True)
-        else:
-            print(False)
+        # if new_x.shape[0] == node_label_graph.shape[0]:
+        #     print(True)
+        # else:
+        #     print(False)
             
         if dataset_name != 'NCI1':
             new_data = Data(x=new_x, edge_index=old_data.edge_index, y=old_data.y, node_label = node_label_graph)

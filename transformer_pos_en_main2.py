@@ -3,6 +3,7 @@
 import os
 import re
 import sys
+import json
 import math
 import time
 import wandb
@@ -62,7 +63,6 @@ def train(model, train_loader, optimizer, max_nodes, device):
             num_nodes = (batch == i).sum().item()
             end_node = start_node + num_nodes
 
-            # adj_loss = torch.norm(adj_recon_list[i] - adj[i], p='fro')**2 / num_nodes
             adj_loss = (torch.norm(adj_recon_list[i] - adj[i], p='fro')**2) / num_nodes
             adj_loss = adj_loss * adj_theta
             
@@ -76,9 +76,6 @@ def train(model, train_loader, optimizer, max_nodes, device):
         node_loss = node_loss * node_theta
         print(f'train_node loss: {node_loss}')
             
-        # dissimmilar = mean_euclidean_distance_loss(train_cls_outputs)
-        # print(f'dissimmilar: {dissimmilar}')
-        
         loss += node_loss
         num_sample += num_graphs
 
@@ -174,32 +171,31 @@ parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
+parser.add_argument("--n-head", type=int, default=2)
+parser.add_argument("--n-layer", type=int, default=2)
 parser.add_argument("--epochs", type=int, default=100)
 parser.add_argument("--patience", type=int, default=5)
-parser.add_argument("--n-cluster", type=int, default=3)
+parser.add_argument("--n-cluster", type=int, default=5)
 parser.add_argument("--n-cross-val", type=int, default=5)
-parser.add_argument("--random-seed", type=int, default=0)
+parser.add_argument("--random-seed", type=int, default=1)
 parser.add_argument("--batch-size", type=int, default=300)
 parser.add_argument("--log-interval", type=int, default=5)
 parser.add_argument("--n-test-anomaly", type=int, default=400)
 parser.add_argument("--test-batch-size", type=int, default=128)
-parser.add_argument("--n-head", type=int, default=8)
-parser.add_argument("--n-layer-n", type=int, default=4)
-parser.add_argument("--n-layer-g", type=int, default=2)
-parser.add_argument("--hidden-dims", nargs='+', type=int, default=[256, 128])
+parser.add_argument("--hidden-dims", nargs='+', type=int, default=[256])
 
 parser.add_argument("--factor", type=float, default=0.5)
 parser.add_argument("--step-size", type=int, default=20)
 parser.add_argument("--test-size", type=float, default=0.25)
 parser.add_argument("--dropout-rate", type=float, default=0.1)
 parser.add_argument("--weight-decay", type=float, default=0.0001)
-parser.add_argument("--learning-rate", type=float, default=0.001)
+parser.add_argument("--learning-rate", type=float, default=0.0001)
 
-parser.add_argument("--alpha", type=float, default=0.3)
-parser.add_argument("--beta", type=float, default=0.025)
-parser.add_argument("--gamma", type=float, default=0.25)
+parser.add_argument("--alpha", type=float, default=1.0)
+parser.add_argument("--beta", type=float, default=0.05)
+parser.add_argument("--gamma", type=float, default=0.1)
 parser.add_argument("--node-theta", type=float, default=0.03)
-parser.add_argument("--adj-theta", type=float, default=0.005)
+parser.add_argument("--adj-theta", type=float, default=0.01)
 
 try:
     args = parser.parse_args()
@@ -215,8 +211,7 @@ dataset_name: str = args.dataset_name
 
 epochs: int = args.epochs
 n_head: int = args.n_head
-n_layer_n: int = args.n_layer_n
-n_layer_g: int = args.n_layer_g
+n_layer: int = args.n_layer
 patience: int = args.patience
 n_cluster: int = args.n_cluster
 step_size: int = args.step_size
@@ -266,16 +261,18 @@ wandb.config = {
 # %%
 '''MODEL CONSTRUCTION'''
 class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout_rate=0.1):
+    def __init__(self, in_channels, out_channels, dropout_rate=0.1, negative_slope=0.1):
         super(ResidualBlock, self).__init__()
         self.conv = GCNConv(in_channels, out_channels, improved=True, add_self_loops=True, normalize=True)
         self.bn = nn.BatchNorm1d(out_channels)
         self.dropout = nn.Dropout(dropout_rate)
         self.shortcut = nn.Linear(in_channels, out_channels) if in_channels != out_channels else nn.Identity()
+        self.activation = nn.LeakyReLU(negative_slope=negative_slope)
+        self.negative_slope = negative_slope
         self.reset_parameters()
 
     def reset_parameters(self):
-        gain = nn.init.calculate_gain('relu')
+        gain = nn.init.calculate_gain('leaky_relu', self.negative_slope)
         nn.init.xavier_uniform_(self.conv.lin.weight, gain=gain)
         nn.init.zeros_(self.conv.bias)
         nn.init.constant_(self.bn.weight, 1)
@@ -283,7 +280,7 @@ class ResidualBlock(nn.Module):
         if isinstance(self.shortcut, nn.Linear):
             nn.init.xavier_uniform_(self.shortcut.weight, gain=1.0)
             nn.init.zeros_(self.shortcut.bias)
-    
+
     def forward(self, x, edge_index):
         residual = self.shortcut(x)
         
@@ -296,10 +293,10 @@ class ResidualBlock(nn.Module):
         
         # 정규화된 인접 행렬을 사용하여 합성곱 적용
         x = self.conv(x, edge_index, norm)
-        
-        x = F.relu(self.bn(x))
+        x = self.activation(self.bn(x))
         x = self.dropout(x)
-        return F.relu(x + residual)
+        
+        return self.activation(x + residual)
     
 
 class Encoder(nn.Module):
@@ -345,19 +342,21 @@ class BilinearEdgeDecoder(nn.Module):
         super(BilinearEdgeDecoder, self).__init__()
         self.max_nodes = max_nodes
         self.sigmoid = nn.Sigmoid()
-        
+    
     def forward(self, z):
         actual_nodes = z.size(0)
         
-        adj = torch.mm(z, z.t())
-        adj = self.sigmoid(adj)
+        z_norm = F.normalize(z, p=2, dim=1) # 각 노드 벡터를 정규화
+        cos_sim = torch.mm(z_norm, z_norm.t()) # 코사인 유사도 계산 (내적으로 계산됨)
+        adj = self.sigmoid(cos_sim)
         adj = adj * (1 - torch.eye(actual_nodes, device=z.device))
         
+        # max_nodes 크기로 패딩
         padded_adj = torch.zeros(self.max_nodes, self.max_nodes, device=z.device)
         padded_adj[:actual_nodes, :actual_nodes] = adj
         
         return padded_adj
-        
+
 
 #%%
 class GraphBertPositionalEncoding(nn.Module):
@@ -511,18 +510,14 @@ class GraphBertPositionalEncoding(nn.Module):
 
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_model, nhead, num_layers_n, num_layers_g, dim_feedforward, max_nodes, dropout=0.1):
+    def __init__(self, d_model, nhead, num_layers, dim_feedforward, max_nodes, dropout=0.1):
         super(TransformerEncoder, self).__init__()
         self.positional_encoding = GraphBertPositionalEncoding(d_model, max_nodes)
-        encoder_layer_n = nn.TransformerEncoderLayer(
+        encoder_layer= nn.TransformerEncoderLayer(
             d_model, nhead, dim_feedforward, dropout, activation='relu', batch_first=True
         )
-        encoder_layer_g = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, activation='relu', batch_first=True
-        )
-        self.transformer_n = nn.TransformerEncoder(encoder_layer_n, num_layers_n)
-        self.transformer_g = nn.TransformerEncoder(encoder_layer_g, num_layers_g)
-
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+        
         self.d_model = d_model
 
 
@@ -563,14 +558,8 @@ class TransformerEncoder(nn.Module):
         # 포지셔널 인코딩 추가
         src_ = src + pos_encoding_batch
         
-        src_ = src_.transpose(0, 1)  # [seq_len, batch_size, hidden_dim]
-        src_key_padding_mask_ = src_key_padding_mask.transpose(0, 1)
-        output = self.transformer_g(src_, src_key_padding_mask=src_key_padding_mask_)
-        output = output.transpose(0, 1)  # [batch_size, seq_len, hidden_dim]
-        
-        # 트랜스포머 인코딩
-        output = self.transformer_n(output, src_key_padding_mask=src_key_padding_mask)
-        
+        output = self.transformer(src_, src_key_padding_mask=src_key_padding_mask)
+                
         return output
 
 
@@ -613,8 +602,7 @@ class GRAPH_AUTOENCODER(nn.Module):
         self.transformer = TransformerEncoder(
             d_model=hidden_dims[-1],
             nhead=n_head,
-            num_layers_n=n_layer_n,
-            num_layers_g=n_layer_g,
+            num_layers=n_layer,
             dim_feedforward=hidden_dims[-1] * 4,
             max_nodes=max_nodes,
             dropout=dropout_rate
@@ -752,9 +740,14 @@ scheduler = ReduceLROnPlateau(optimizer, mode='max', factor=factor, patience=pat
 
 # %%
 '''RUN'''
-def run(dataset_name, random_seed, dataset_AN, split=None, device=device):
-    all_results = []
+def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=None):
+    if epoch_results is None:
+        epoch_results = {}
+    
     set_seed(random_seed)
+    all_results = []
+    split=splits[trial]
+    epoch_interval = 10  # 10 에폭 단위로 비교
 
     loaders, meta = get_data_loaders_TU(dataset_name, batch_size, test_batch_size, split, dataset_AN)
     num_features = meta['num_feat']
@@ -779,10 +772,10 @@ def run(dataset_name, random_seed, dataset_AN, split=None, device=device):
 
         if epoch % log_interval == 0:
             
-            # kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
+            kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
             
-            cluster_centers = train_cls_outputs.mean(dim=0)
-            cluster_centers = cluster_centers.detach().cpu().numpy()
+            # cluster_centers = train_cls_outputs.mean(dim=0)
+            # cluster_centers = cluster_centers.detach().cpu().numpy()
             cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
 
             auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
@@ -804,10 +797,20 @@ def run(dataset_name, random_seed, dataset_AN, split=None, device=device):
             })
 
             info_test = 'AD_AUC:{:.4f}, AD_AUPRC:{:.4f}, Test_Loss:{:.4f}, Test_Loss_Anomaly:{:.4f}'.format(auroc, auprc, test_loss, test_loss_anomaly)
-
             print(info_train + '   ' + info_test)
 
-    return auroc
+            # 10 에폭 단위일 때 결과 저장
+            if epoch % epoch_interval == 0:
+                if epoch not in epoch_results:
+                    epoch_results[epoch] = {'aurocs': [], 'auprcs': [], 'precisions': [], 'recalls': [], 'f1s': []}
+                
+                epoch_results[epoch]['aurocs'].append(auroc)
+                epoch_results[epoch]['auprcs'].append(auprc)
+                epoch_results[epoch]['precisions'].append(precision)
+                epoch_results[epoch]['recalls'].append(recall)
+                epoch_results[epoch]['f1s'].append(f1)
+                
+    return auroc, epoch_results
 
 
 #%%
@@ -815,15 +818,14 @@ def run(dataset_name, random_seed, dataset_AN, split=None, device=device):
 if __name__ == '__main__':
     ad_aucs = []
     fold_times = []
+    epoch_results = {}  # 모든 폴드의 에폭별 결과를 저장
     splits = get_ad_split_TU(dataset_name, n_cross_val)    
-
     start_time = time.time()  # 전체 실행 시작 시간
 
     for trial in range(n_cross_val):
         fold_start = time.time()  # 현재 폴드 시작 시간
-
         print(f"Starting fold {trial + 1}/{n_cross_val}")
-        ad_auc = run(dataset_name, random_seed, dataset_AN, split=splits[trial])
+        ad_auc, epoch_results = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
         ad_aucs.append(ad_auc)
         
         fold_end = time.time()  # 현재 폴드 종료 시간
@@ -831,12 +833,57 @@ if __name__ == '__main__':
         fold_times.append(fold_duration)
         
         print(f"Fold {trial + 1} finished in {fold_duration:.2f} seconds.")
+    
+    # 각 에폭별 평균 성능 계산
+    epoch_means = {}
+    epoch_stds = {}
+    for epoch in epoch_results.keys():
+        epoch_means[epoch] = {
+            'auroc': np.mean(epoch_results[epoch]['aurocs']),
+            'auprc': np.mean(epoch_results[epoch]['auprcs']),
+            'precision': np.mean(epoch_results[epoch]['precisions']),
+            'recall': np.mean(epoch_results[epoch]['recalls']),
+            'f1': np.mean(epoch_results[epoch]['f1s'])
+        }
+        epoch_stds[epoch] = {
+            'auroc': np.std(epoch_results[epoch]['aurocs']),
+            'auprc': np.std(epoch_results[epoch]['auprcs']),
+            'precision': np.std(epoch_results[epoch]['precisions']),
+            'recall': np.std(epoch_results[epoch]['recalls']),
+            'f1': np.std(epoch_results[epoch]['f1s'])
+        }
         
-    total_time = time.time() - start_time  # 전체 실행 시간
+    # 최고 성능을 보인 에폭 찾기
+    best_epoch = max(epoch_means.keys(), key=lambda x: epoch_means[x]['auroc'])
+    
+    # 결과 출력
+    print("\n=== Performance at every 10 epochs (averaged over all folds) ===")
+    for epoch in sorted(epoch_means.keys()):
+        print(f"Epoch {epoch}: AUROC = {epoch_means[epoch]['auroc']:.4f} ± {epoch_stds[epoch]['auroc']:.4f}")
+    
+    print(f"\nBest average performance achieved at epoch {best_epoch}:")
+    print(f"AUROC = {epoch_means[best_epoch]['auroc']:.4f} ± {epoch_stds[best_epoch]['auroc']:.4f}")
+    print(f"AUPRC = {epoch_means[best_epoch]['auprc']:.4f} ± {epoch_stds[best_epoch]['auprc']:.4f}")
+    print(f"F1 = {epoch_means[best_epoch]['f1']:.4f} ± {epoch_stds[best_epoch]['f1']:.4f}")
+    
+    # 최종 결과 저장
+    total_time = time.time() - start_time
     results = 'AUC: {:.2f}+-{:.2f}'.format(np.mean(ad_aucs) * 100, np.std(ad_aucs) * 100)
     print('[FINAL RESULTS] ' + results)
     print(f"Total execution time: {total_time:.2f} seconds")
-
+    
+    # 모든 결과를 JSON으로 저장
+    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.json'
+    os.makedirs(os.path.dirname(results_path), exist_ok=True)
+    with open(results_path, 'w') as f:
+        json.dump({
+            'epoch_means': epoch_means,
+            'epoch_stds': epoch_stds,
+            'best_epoch': int(best_epoch),
+            'final_auroc_mean': float(np.mean(ad_aucs)),
+            'final_auroc_std': float(np.std(ad_aucs))
+        }, f, indent=4)
+        
 
 wandb.finish()
 
