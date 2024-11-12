@@ -80,44 +80,238 @@ def train_bert_embedding(model, train_loader, bert_optimizer, device):
 
 
 #%%
-def train_bert_embedding_(model, train_loader, bert_optimizer, device):
-    model.train()
-    total_loss = 0
-    num_sample = 0
+# def train_bert_embedding_(model, train_loader, bert_optimizer, device):
+#     model.train()
+#     total_loss = 0
+#     num_sample = 0
     
-    for data in train_loader:
-        bert_optimizer.zero_grad()
-        data = data.to(device)
-        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+#     for data in train_loader:
+#         bert_optimizer.zero_grad()
+#         data = data.to(device)
+#         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
         
-        adj = adj_original(edge_index, batch, max_nodes)
+#         adj = adj_original(edge_index, batch, max_nodes)
         
-        # BERT 인코딩 및 마스크 토큰 예측만 수행
-        _, _, adj_recon_list = model(
-            x, edge_index, batch, num_graphs, training=True, edge_training=True
-        )
+#         # BERT 인코딩 및 마스크 토큰 예측만 수행
+#         _, _, adj_recon_list = model(
+#             x, edge_index, batch, num_graphs, training=True, edge_training=True
+#         )
 
-        loss = 0
-        start_node = 0
-        for i in range(num_graphs):
-            num_nodes = (batch == i).sum().item()
-            end_node = start_node + num_nodes
+#         loss = 0
+#         start_node = 0
+#         for i in range(num_graphs):
+#             num_nodes = (batch == i).sum().item()
+#             end_node = start_node + num_nodes
             
-            adj_loss = torch.norm(adj_recon_list[i] - adj[i], p='fro')**2 / num_nodes
-            adj_loss = adj_loss / 20
-            loss += adj_loss
+#             adj_loss = torch.norm(adj_recon_list[i] - adj[i], p='fro')**2 / num_nodes
+#             adj_loss = adj_loss / 20
+#             loss += adj_loss
             
-            start_node = end_node
+#             start_node = end_node
             
-        print(f'edge_loss:{loss}')
-        # print(f'mask_label:{mask_loss_}')
+#         print(f'edge_loss:{loss}')
+#         # print(f'mask_label:{mask_loss_}')
         
-        loss.backward()
-        bert_optimizer.step()
-        total_loss += loss.item()
-        num_sample += num_graphs
+#         loss.backward()
+#         bert_optimizer.step()
+#         total_loss += loss.item()
+#         num_sample += num_graphs
     
-    return total_loss / len(train_loader), num_sample
+#     return total_loss / len(train_loader), num_sample
+
+
+# def train(model, train_loader, recon_optimizer, max_nodes, device):
+#     model.train()
+#     total_loss = 0
+#     total_recon_loss = 0
+#     total_cls_loss = 0
+#     num_sample = 0
+    
+#     for data in train_loader:
+#         recon_optimizer.zero_grad()
+#         data = data.to(device)
+#         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        
+#         train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
+        
+#         recon_loss = 0
+#         start_node = 0
+#         for i in range(num_graphs):
+#             num_nodes = (batch == i).sum().item()
+#             end_node = start_node + num_nodes
+
+#             node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+            
+#             recon_loss += node_loss
+
+#             start_node = end_node
+                
+#         # CLS Similarity Loss
+#         if num_graphs > 1:  # 배치에 2개 이상의 그래프가 있을 때만 계산
+#             # 1. Pairwise Distance Matrix 계산
+#             cls_distances = torch.cdist(train_cls_outputs, train_cls_outputs, p=2)  # [num_graphs, num_graphs]
+            
+#             # 2. 대각선 요소 제외 (자기 자신과의 거리)
+#             mask = ~torch.eye(num_graphs, dtype=bool, device=device)
+#             cls_distances = cls_distances[mask]
+            
+#             # 3. 평균 거리 계산
+#             cls_loss = cls_distances.mean()
+#         else:
+#             cls_loss = torch.tensor(0.0, device=device)
+                
+#         # Total Loss (alpha는 CLS 손실의 가중치)
+#         alpha = 100.0  # 이 값은 조정 가능
+#         cls_loss = alpha * cls_loss
+#         loss = recon_loss + cls_loss
+            
+#         num_sample += num_graphs
+#         loss.backward()
+#         recon_optimizer.step()
+        
+#         total_loss += loss.item()
+#         total_recon_loss += recon_loss.item()
+#         total_cls_loss += cls_loss.item()
+        
+#         print(f'train_recon_loss: {recon_loss.item():.4f}, train_cls_loss: {cls_loss.item():.4f}')
+
+#     avg_loss = total_loss / len(train_loader)
+#     avg_recon_loss = total_recon_loss / len(train_loader)
+#     avg_cls_loss = total_cls_loss / len(train_loader)
+    
+#     print(f'Average reconstruction loss: {avg_recon_loss:.4f}')
+#     print(f'Average CLS similarity loss: {avg_cls_loss:.4f}')        
+        
+#     return avg_loss, num_sample, train_cls_outputs.detach().cpu()
+
+
+# def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
+#     model.eval()
+#     total_loss_ = 0
+#     total_loss_anomaly_ = 0
+#     all_labels = []
+#     all_scores = []
+#     reconstruction_errors = []  # 새로 추가
+    
+#     # 정규화를 위한 최대/최소값 초기화
+#     max_node_loss = float('-inf')
+#     min_node_loss = float('inf')
+#     max_cluster_dist = float('-inf')
+#     min_cluster_dist = float('inf')
+    
+#     with torch.no_grad():
+#         for data in test_loader:
+#             data = data.to(device)
+#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            
+#             start_node = 0
+#             for i in range(num_graphs):
+#                 num_nodes = (batch == i).sum().item()
+#                 end_node = start_node + num_nodes
+                
+#                 # Reconstruction error 계산
+#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+#                 node_loss = node_loss.item()
+                
+#                 # Clustering distance 계산
+#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
+#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
+#                 min_distance = distances.min()
+                
+#                 # 최대/최소값 업데이트
+#                 max_node_loss = max(max_node_loss, node_loss)
+#                 min_node_loss = min(min_node_loss, node_loss)
+#                 max_cluster_dist = max(max_cluster_dist, min_distance)
+#                 min_cluster_dist = min(min_cluster_dist, min_distance)
+                    
+#                 start_node = end_node
+                    
+    
+#     # 두 번째 패스: 정규화된 값으로 평가
+#     with torch.no_grad():
+#         for data in test_loader:
+#             data = data.to(device)
+#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            
+#             recon_errors = []
+#             start_node = 0
+            
+#             for i in range(num_graphs):
+#                 num_nodes = (batch == i).sum().item()
+#                 end_node = start_node + num_nodes
+                
+#                 # Reconstruction error 계산 및 정규화 (0~1)
+#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+#                 node_loss = node_loss.item()
+#                 normalized_node_loss = (node_loss - min_node_loss) / (max_node_loss - min_node_loss)
+                
+#                 # Clustering distance 계산 및 정규화 (0~1)
+#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
+#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
+#                 min_distance = distances.min().item()
+#                 normalized_cluster_dist = (min_distance - min_cluster_dist) / (max_cluster_dist - min_cluster_dist)
+                
+#                 # 정규화된 에러값들 저장
+#                 reconstruction_errors.append({
+#                     'reconstruction': normalized_node_loss,
+#                     'clustering': normalized_cluster_dist,
+#                     'is_anomaly': data.y[i].item() == 1
+#                 })
+                
+#                 # 전체 에러는 정규화된 값들의 평균으로 계산
+#                 total_error = (normalized_node_loss * 10) + (normalized_cluster_dist * 5)
+#                 print(f'normalized node loss: {normalized_node_loss * 10}')
+#                 print(f'normalized cluster dist: {normalized_cluster_dist * 5}')
+#                 recon_errors.append(total_error)
+                
+#                 if data.y[i].item() == 0:
+#                     total_loss_ += total_error
+#                 else:
+#                     total_loss_anomaly_ += total_error
+                    
+#                 start_node = end_node
+            
+#             all_scores.extend(recon_errors)
+#             all_labels.extend(data.y.cpu().numpy())
+    
+#     # 시각화를 위한 데이터 변환
+#     visualization_data = {
+#         'normal': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors if not error['is_anomaly']
+#         ],
+#         'anomaly': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors if error['is_anomaly']
+#         ]
+#     }
+    
+#     # 메트릭 계산
+#     all_labels = np.array(all_labels)
+#     all_scores = np.array(all_scores)
+    
+#     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+#     auroc = auc(fpr, tpr)
+#     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
+#     auprc = auc(recall, precision)
+    
+#     # 최적 임계값 찾기
+#     optimal_idx = np.argmax(tpr - fpr)
+#     optimal_threshold = thresholds[optimal_idx]
+#     pred_labels = (all_scores > optimal_threshold).astype(int)
+    
+#     precision = precision_score(all_labels, pred_labels)
+#     recall = recall_score(all_labels, pred_labels)
+#     f1 = f1_score(all_labels, pred_labels)
+    
+#     total_loss_mean = total_loss_ / sum(all_labels == 0)
+#     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
+    
+#     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
 
 
 #%%
@@ -165,42 +359,6 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     all_scores = []
     reconstruction_errors = []  # 새로 추가
     
-    # 정규화를 위한 최대/최소값 초기화
-    max_node_loss = float('-inf')
-    min_node_loss = float('inf')
-    max_cluster_dist = float('-inf')
-    min_cluster_dist = float('inf')
-    
-    with torch.no_grad():
-        for data in test_loader:
-            data = data.to(device)
-            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
-            
-            start_node = 0
-            for i in range(num_graphs):
-                num_nodes = (batch == i).sum().item()
-                end_node = start_node + num_nodes
-                
-                # Reconstruction error 계산
-                node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-                node_loss = node_loss.item()
-                
-                # Clustering distance 계산
-                cls_vec = e_cls_output[i].detach().cpu().numpy()
-                distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-                min_distance = distances.min()
-                
-                # 최대/최소값 업데이트
-                max_node_loss = max(max_node_loss, node_loss)
-                min_node_loss = min(min_node_loss, node_loss)
-                max_cluster_dist = max(max_cluster_dist, min_distance)
-                min_cluster_dist = min(min_cluster_dist, min_distance)
-                    
-                start_node = end_node
-                    
-    
-    # 두 번째 패스: 정규화된 값으로 평가
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
@@ -209,34 +367,34 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
             
             recon_errors = []
             start_node = 0
-            
             for i in range(num_graphs):
                 num_nodes = (batch == i).sum().item()
                 end_node = start_node + num_nodes
                 
-                # Reconstruction error 계산 및 정규화 (0~1)
+                # Reconstruction error 계산
                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
                 node_loss = node_loss.item()
-                normalized_node_loss = (node_loss - min_node_loss) / (max_node_loss - min_node_loss)
-                
-                # Clustering distance 계산 및 정규화 (0~1)
+                scaled_node_loss = torch.sigmoid(torch.tensor(node_loss)).item() * 10
+
+                # Clustering distance 계산 후 시그모이드 적용
                 cls_vec = e_cls_output[i].detach().cpu().numpy()
                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
                 min_distance = distances.min().item()
-                normalized_cluster_dist = (min_distance - min_cluster_dist) / (max_cluster_dist - min_cluster_dist)
+                scaled_cluster_dist = torch.sigmoid(torch.tensor(min_distance)).item() * 5
                 
-                # 정규화된 에러값들 저장
+                # 변환된 값들 저장
                 reconstruction_errors.append({
-                    'reconstruction': normalized_node_loss,
-                    'clustering': normalized_cluster_dist,
+                    'reconstruction': scaled_node_loss,
+                    'clustering': scaled_cluster_dist,
                     'is_anomaly': data.y[i].item() == 1
                 })
-                
-                # 전체 에러는 정규화된 값들의 평균으로 계산
-                total_error = (normalized_node_loss * 10) + (normalized_cluster_dist * 5)
-                print(f'normalized node loss: {normalized_node_loss * 10}')
-                print(f'normalized cluster dist: {normalized_cluster_dist * 5}')
+
+                # 전체 에러는 변환된 값들의 평균으로 계산
+                total_error = scaled_node_loss + scaled_cluster_dist
                 recon_errors.append(total_error)
+                
+                print(f'scaled_node_loss:{scaled_node_loss}')
+                print(f'scaled_cluster_dist:{scaled_cluster_dist}')
                 
                 if data.y[i].item() == 0:
                     total_loss_ += total_error
@@ -282,7 +440,7 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-    
+
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
 
 
@@ -294,9 +452,11 @@ parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
+parser.add_argument("--n-head-BERT", type=int, default=4)
+parser.add_argument("--n-layer-BERT", type=int, default=4)
 parser.add_argument("--n-head", type=int, default=2)
 parser.add_argument("--n-layer", type=int, default=2)
-parser.add_argument("--BERT-epochs", type=int, default=100)
+parser.add_argument("--BERT-epochs", type=int, default=300)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--n-cluster", type=int, default=3)
@@ -335,6 +495,8 @@ dataset_name: str = args.dataset_name
 
 BERT_epochs: int = args.BERT_epochs
 epochs: int = args.epochs
+n_head_BERT: int = args.n_head_BERT
+n_layer_BERT: int = args.n_layer_BERT
 n_head: int = args.n_head
 n_layer: int = args.n_layer
 patience: int = args.patience
@@ -759,14 +921,14 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters):
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
 class GRAPH_AUTOENCODER(nn.Module):
-    def __init__(self, num_features, hidden_dims, max_nodes, nhead, num_layers, dropout_rate=0.1):
+    def __init__(self, num_features, hidden_dims, max_nodes, nhead_BERT, nhead, num_layers_BERT, num_layers, dropout_rate=0.1):
         super().__init__()
         self.encoder = BertEncoder(
             num_features=num_features,
             hidden_dims=hidden_dims,
             d_model=hidden_dims[-1],
-            nhead=nhead,
-            num_layers=num_layers,
+            nhead=nhead_BERT,
+            num_layers=num_layers_BERT,
             max_nodes=max_nodes,
             dropout_rate=dropout_rate
         )
@@ -841,6 +1003,9 @@ print(f'Number of features: {num_features}')
 print(f'Number of edge features: {num_edge_features}')
 print(f'Max nodes: {max_nodes}')
 
+current_time_ = time.localtime()
+current_time = time.strftime("%Y_%m_%d_%H_%M", current_time_)
+print(f'random number saving: {current_time}')
 
 # %%
 '''RUN'''
@@ -859,13 +1024,15 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     max_node_label = meta['max_node_label']
     
     # BERT 모델 저장 경로
-    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
+    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
     
     model = GRAPH_AUTOENCODER(
         num_features=num_features, 
         hidden_dims=hidden_dims, 
         max_nodes=max_nodes,
+        nhead_BERT=n_head_BERT,
         nhead=n_head,
+        num_layers_BERT=n_layer_BERT,
         num_layers=n_layer,
         dropout_rate=dropout_rate
     ).to(device)
@@ -929,7 +1096,12 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
 
             auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
             
-            save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}/error_distribution_epoch_{epoch}_fold_{trial}.json'
+            save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
+            os.makedirs(os.path.dirname(save_path_), exist_ok=True)
+            save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/'
+            os.makedirs(os.path.dirname(save_path_), exist_ok=True)
+            
+            save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/error_distribution_epoch_{epoch}_fold_{trial}.json'
             with open(save_path, 'w') as f:
                 json.dump(visualization_data, f)
             
@@ -1025,7 +1197,7 @@ if __name__ == '__main__':
     print(f"Total execution time: {total_time:.2f} seconds")
     
     # 모든 결과를 JSON으로 저장
-    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.json'
+    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9_2.json'
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
     with open(results_path, 'w') as f:
         json.dump({
@@ -1038,7 +1210,7 @@ if __name__ == '__main__':
 
 
 #%%
-base_dir = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}/'
+base_dir = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
 
 for trial in range(n_cross_val):    
     for epoch in range(1, epochs + 1):    
@@ -1064,7 +1236,7 @@ for trial in range(n_cross_val):
             plt.grid(True)
 
             # 저장하거나 보여주기
-            plt.savefig(f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}/error_distribution_plot_epoch_{epoch}_fold_{trial}.png')  # 파일로 저장
+            plt.savefig(f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/error_distribution_plot_epoch_{epoch}_fold_{trial}.png')  # 파일로 저장
             plt.show()  # 직접 보기
 
 
