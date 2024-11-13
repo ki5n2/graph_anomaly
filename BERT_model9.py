@@ -15,6 +15,7 @@ import torch
 import random
 import argparse
 import numpy as np
+import seaborn as sns
 import torch.nn as nn
 import torch.optim as optim
 import matplotlib.pyplot as plt
@@ -32,6 +33,7 @@ from torch_geometric.utils import to_networkx, get_laplacian, to_dense_adj, to_d
 from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, global_add_pool
 
 from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
 from scipy.stats import wasserstein_distance
 from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score
@@ -445,6 +447,126 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
 
 
 #%%
+def analyze_cls_embeddings(model, test_loader, epoch, device, n_components=2):
+    """
+    CLS token embeddings를 추출하고 PCA를 적용하여 더 자세한 분석 수행
+    
+    Args:
+        model: 학습된 모델
+        test_loader: 테스트 데이터 로더
+        device: 연산 장치
+        n_components: PCA 차원 수
+    """
+    model.eval()
+    cls_embeddings = []
+    labels = []
+    
+    # CLS embeddings 추출
+    with torch.no_grad():
+        for data in test_loader:
+            data = data.to(device)
+            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+            
+            cls_output, _ = model(x, edge_index, batch, num_graphs)
+            cls_embeddings.append(cls_output.cpu())
+            labels.extend(data.y.cpu().numpy())
+    
+    # 텐서를 numpy 배열로 변환
+    cls_embeddings = torch.cat(cls_embeddings, dim=0).numpy()
+    labels = np.array(labels)
+    
+    # PCA 적용
+    pca = PCA()
+    cls_embeddings_pca = pca.fit_transform(cls_embeddings)
+    
+    # 분산 설명률 계산
+    explained_variance_ratio = pca.explained_variance_ratio_
+    cumulative_variance_ratio = np.cumsum(explained_variance_ratio)
+    eigenvalues = pca.explained_variance_
+    
+    # 시각화
+    plt.figure(figsize=(20, 15))
+    
+    # 1. PCA 산점도 (첫 2개 주성분)
+    plt.subplot(221)
+    scatter = plt.scatter(cls_embeddings_pca[:, 0], cls_embeddings_pca[:, 1], 
+                         c=labels, cmap='coolwarm', alpha=0.6)
+    plt.colorbar(scatter, label='Label (0: Normal, 1: Anomaly)')
+    plt.xlabel(f'PC1 (variance ratio: {explained_variance_ratio[0]:.3f})')
+    plt.ylabel(f'PC2 (variance ratio: {explained_variance_ratio[1]:.3f})')
+    plt.title('PCA of CLS Token Embeddings')
+    
+    # 2. 누적 분산 설명률
+    plt.subplot(222)
+    plt.plot(range(1, len(cumulative_variance_ratio) + 1), 
+             cumulative_variance_ratio, 'bo-')
+    plt.axhline(y=0.95, color='r', linestyle='--', label='95% threshold')
+    plt.xlabel('Number of Components')
+    plt.ylabel('Cumulative Explained Variance Ratio')
+    plt.title('Cumulative Explained Variance Ratio')
+    plt.grid(True)
+    plt.legend()
+    
+    # 3. 스크린 플롯
+    plt.subplot(223)
+    plt.plot(range(1, len(eigenvalues) + 1), eigenvalues, 'bo-')
+    plt.xlabel('Principal Component')
+    plt.ylabel('Eigenvalue')
+    plt.title('Scree Plot')
+    plt.grid(True)
+    
+    # 4. 로그 스케일 스크린 플롯
+    plt.subplot(224)
+    plt.plot(range(1, len(eigenvalues) + 1), eigenvalues, 'bo-')
+    plt.yscale('log')
+    plt.xlabel('Principal Component')
+    plt.ylabel('Eigenvalue (log scale)')
+    plt.title('Scree Plot (Log Scale)')
+    plt.grid(True)
+    
+    plt.tight_layout()
+    
+    # 분석 결과 저장
+    save_path = f'/home1/rldnjs16/graph_anomaly_detection/pca_analysis/cls_pca_analysis_{dataset_name}_fold_{trial}_ep_{epoch}_{current_time}.png'
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path)
+    plt.close()
+    
+    # 주요 지표 계산
+    n_components_90 = np.argmax(cumulative_variance_ratio >= 0.9) + 1
+    n_components_95 = np.argmax(cumulative_variance_ratio >= 0.95) + 1
+    
+    # 분석 결과 출력
+    print("\nPCA Analysis Results:")
+    print(f"Number of features in original space: {cls_embeddings.shape[1]}")
+    print(f"Number of components needed for 90% variance: {n_components_90}")
+    print(f"Number of components needed for 95% variance: {n_components_95}")
+    print("\nTop 5 Principal Components:")
+    for i in range(5):
+        print(f"PC{i+1}: {explained_variance_ratio[i]:.4f} "
+              f"(cumulative: {cumulative_variance_ratio[i]:.4f})")
+    
+    # Class separation analysis
+    normal_indices = labels == 0
+    anomaly_indices = labels == 1
+    
+    pc1_normal = cls_embeddings_pca[normal_indices, 0]
+    pc1_anomaly = cls_embeddings_pca[anomaly_indices, 0]
+    pc2_normal = cls_embeddings_pca[normal_indices, 1]
+    pc2_anomaly = cls_embeddings_pca[anomaly_indices, 1]
+    
+    print("\nClass Separation Analysis:")
+    print("PC1 - Normal vs Anomaly:")
+    print(f"Normal mean: {np.mean(pc1_normal):.4f}, std: {np.std(pc1_normal):.4f}")
+    print(f"Anomaly mean: {np.mean(pc1_anomaly):.4f}, std: {np.std(pc1_anomaly):.4f}")
+    print("\nPC2 - Normal vs Anomaly:")
+    print(f"Normal mean: {np.mean(pc2_normal):.4f}, std: {np.std(pc2_normal):.4f}")
+    print(f"Anomaly mean: {np.mean(pc2_anomaly):.4f}, std: {np.std(pc2_anomaly):.4f}")
+    
+    return cls_embeddings_pca, explained_variance_ratio, eigenvalues
+
+
+#%%
 '''ARGPARSER'''
 parser = argparse.ArgumentParser()
 
@@ -452,11 +574,11 @@ parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
-parser.add_argument("--n-head-BERT", type=int, default=4)
-parser.add_argument("--n-layer-BERT", type=int, default=4)
+parser.add_argument("--n-head-BERT", type=int, default=2)
+parser.add_argument("--n-layer-BERT", type=int, default=2)
 parser.add_argument("--n-head", type=int, default=2)
 parser.add_argument("--n-layer", type=int, default=2)
-parser.add_argument("--BERT-epochs", type=int, default=300)
+parser.add_argument("--BERT-epochs", type=int, default=100)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--n-cluster", type=int, default=3)
@@ -1091,7 +1213,10 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
         if epoch % log_interval == 0:
-            kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
+            # kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
+            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            cluster_centers = train_cls_outputs.mean(dim=0)
+            cluster_centers = cluster_centers.detach().cpu().numpy()
             cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
 
             auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
@@ -1133,8 +1258,11 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
                 epoch_results[epoch]['precisions'].append(precision)
                 epoch_results[epoch]['recalls'].append(recall)
                 epoch_results[epoch]['f1s'].append(f1)
-                
-    return auroc, epoch_results
+
+            # run() 함수 내에서 평가 시점에 다음 코드 추가
+            cls_embeddings_pca, explained_variance_ratio, eigenvalues = analyze_cls_embeddings(model, test_loader, epoch, device)
+
+    return auroc, epoch_results, cls_embeddings_pca, explained_variance_ratio, eigenvalues
 
 
 #%%
@@ -1149,7 +1277,7 @@ if __name__ == '__main__':
     for trial in range(n_cross_val):
         fold_start = time.time()  # 현재 폴드 시작 시간
         print(f"Starting fold {trial + 1}/{n_cross_val}")
-        ad_auc, epoch_results = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
+        ad_auc, epoch_results, cls_embeddings_pca, explained_variance_ratio, eigenvalues = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
         ad_aucs.append(ad_auc)
         
         fold_end = time.time()  # 현재 폴드 종료 시간   
