@@ -38,6 +38,8 @@ from scipy.spatial.distance import cdist
 from scipy.stats import wasserstein_distance
 from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from sklearn.metrics.pairwise import rbf_kernel
+from sklearn.cluster import SpectralClustering
 
 from functools import partial
 from scipy.linalg import eigh
@@ -353,6 +355,99 @@ def train(model, train_loader, recon_optimizer, max_nodes, device):
 
 
 #%%
+# def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
+#     model.eval()
+#     total_loss_ = 0
+#     total_loss_anomaly_ = 0
+#     all_labels = []
+#     all_scores = []
+#     reconstruction_errors = []  # 새로 추가
+    
+#     with torch.no_grad():
+#         for data in test_loader:
+#             data = data.to(device)
+#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            
+#             recon_errors = []
+#             start_node = 0
+#             for i in range(num_graphs):
+#                 num_nodes = (batch == i).sum().item()
+#                 end_node = start_node + num_nodes
+                
+#                 # Reconstruction error 계산
+#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+#                 node_loss = node_loss.item()
+#                 scaled_node_loss = torch.sigmoid(torch.tensor(node_loss)).item() * 10
+
+#                 # Clustering distance 계산 후 시그모이드 적용
+#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
+#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
+#                 min_distance = distances.min().item()
+#                 scaled_cluster_dist = torch.sigmoid(torch.tensor(min_distance)).item() * 5
+                
+#                 # 변환된 값들 저장
+#                 reconstruction_errors.append({
+#                     'reconstruction': scaled_node_loss,
+#                     'clustering': scaled_cluster_dist,
+#                     'is_anomaly': data.y[i].item() == 1
+#                 })
+
+#                 # 전체 에러는 변환된 값들의 평균으로 계산
+#                 total_error = scaled_node_loss + scaled_cluster_dist
+#                 recon_errors.append(total_error)
+                
+#                 print(f'scaled_node_loss:{scaled_node_loss}')
+#                 print(f'scaled_cluster_dist:{scaled_cluster_dist}')
+                
+#                 if data.y[i].item() == 0:
+#                     total_loss_ += total_error
+#                 else:
+#                     total_loss_anomaly_ += total_error
+                    
+#                 start_node = end_node
+            
+#             all_scores.extend(recon_errors)
+#             all_labels.extend(data.y.cpu().numpy())
+    
+#     # 시각화를 위한 데이터 변환
+#     visualization_data = {
+#         'normal': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors if not error['is_anomaly']
+#         ],
+#         'anomaly': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors if error['is_anomaly']
+#         ]
+#     }
+    
+#     # 메트릭 계산
+#     all_labels = np.array(all_labels)
+#     all_scores = np.array(all_scores)
+    
+#     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+#     auroc = auc(fpr, tpr)
+#     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
+#     auprc = auc(recall, precision)
+    
+#     # 최적 임계값 찾기
+#     optimal_idx = np.argmax(tpr - fpr)
+#     optimal_threshold = thresholds[optimal_idx]
+#     pred_labels = (all_scores > optimal_threshold).astype(int)
+    
+#     precision = precision_score(all_labels, pred_labels)
+#     recall = recall_score(all_labels, pred_labels)
+#     f1 = f1_score(all_labels, pred_labels)
+    
+#     total_loss_mean = total_loss_ / sum(all_labels == 0)
+#     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
+
+#     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
+
+
 def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     model.eval()
     total_loss_ = 0
@@ -360,54 +455,50 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     all_labels = []
     all_scores = []
     reconstruction_errors = []  # 새로 추가
-    
+
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
-            
+
             recon_errors = []
             start_node = 0
             for i in range(num_graphs):
                 num_nodes = (batch == i).sum().item()
                 end_node = start_node + num_nodes
                 
-                # Reconstruction error 계산
                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-                node_loss = node_loss.item()
-                scaled_node_loss = torch.sigmoid(torch.tensor(node_loss)).item() * 10
-
-                # Clustering distance 계산 후 시그모이드 적용
-                cls_vec = e_cls_output[i].detach().cpu().numpy()
-                distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-                min_distance = distances.min().item()
-                scaled_cluster_dist = torch.sigmoid(torch.tensor(min_distance)).item() * 5
+                node_loss = node_loss.item() * alpha
                 
+                # cls_vec = e_cls_output[i].cpu().numpy()  # [hidden_dim]
+                cls_vec = e_cls_output[i].detach().cpu().numpy()  # [hidden_dim]
+                distances = cdist([cls_vec], cluster_centers, metric='euclidean')  # [1, n_clusters]
+                min_distance = distances.min().item() * gamma
+
                 # 변환된 값들 저장
                 reconstruction_errors.append({
-                    'reconstruction': scaled_node_loss,
-                    'clustering': scaled_cluster_dist,
+                    'reconstruction': node_loss,
+                    'clustering': min_distance,
                     'is_anomaly': data.y[i].item() == 1
                 })
 
-                # 전체 에러는 변환된 값들의 평균으로 계산
-                total_error = scaled_node_loss + scaled_cluster_dist
-                recon_errors.append(total_error)
+                recon_error = node_loss + min_distance              
+                recon_errors.append(recon_error)
                 
-                print(f'scaled_node_loss:{scaled_node_loss}')
-                print(f'scaled_cluster_dist:{scaled_cluster_dist}')
-                
+                print(f'test_node_loss: {node_loss}')
+                print(f'test_min_distance: {min_distance}')
+
                 if data.y[i].item() == 0:
-                    total_loss_ += total_error
+                    total_loss_ += recon_error
                 else:
-                    total_loss_anomaly_ += total_error
-                    
+                    total_loss_anomaly_ += recon_error
+
                 start_node = end_node
             
             all_scores.extend(recon_errors)
             all_labels.extend(data.y.cpu().numpy())
-    
+
     # 시각화를 위한 데이터 변환
     visualization_data = {
         'normal': [
@@ -425,24 +516,25 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     # 메트릭 계산
     all_labels = np.array(all_labels)
     all_scores = np.array(all_scores)
-    
+
+    # Compute metrics
     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
     auroc = auc(fpr, tpr)
     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
     auprc = auc(recall, precision)
-    
+
     # 최적 임계값 찾기
     optimal_idx = np.argmax(tpr - fpr)
     optimal_threshold = thresholds[optimal_idx]
     pred_labels = (all_scores > optimal_threshold).astype(int)
-    
+
     precision = precision_score(all_labels, pred_labels)
     recall = recall_score(all_labels, pred_labels)
     f1 = f1_score(all_labels, pred_labels)
-    
+
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-
+    
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
 
 
@@ -581,7 +673,7 @@ parser.add_argument("--n-layer", type=int, default=2)
 parser.add_argument("--BERT-epochs", type=int, default=100)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--patience", type=int, default=5)
-parser.add_argument("--n-cluster", type=int, default=3)
+parser.add_argument("--n-cluster", type=int, default=5)
 parser.add_argument("--step-size", type=int, default=20)
 parser.add_argument("--n-cross-val", type=int, default=5)
 parser.add_argument("--random-seed", type=int, default=1)
@@ -1034,10 +1126,52 @@ class TransformerEncoder(nn.Module):
         return output
     
 
+#%%
 def perform_clustering(train_cls_outputs, random_seed, n_clusters):
     cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
     kmeans = KMeans(n_clusters=n_clusters, random_state=random_seed, n_init="auto").fit(cls_outputs_np)
     return kmeans, kmeans.cluster_centers_
+
+
+# def perform_clustering(train_cls_outputs, random_seed, n_clusters):
+#     """
+#     스펙트럴 클러스터링을 수행하는 함수
+    
+#     Args:
+#         train_cls_outputs: 학습 데이터의 CLS 토큰 출력값
+#         random_seed: 랜덤 시드
+#         n_clusters: 클러스터 수
+    
+#     Returns:
+#         spectral: 학습된 스펙트럴 클러스터링 모델
+#         cluster_centers: 각 클러스터의 중심점
+#     """
+#     # CPU로 이동 및 Numpy 배열로 변환
+#     cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
+    
+#     # 유사도 행렬 계산 (RBF 커널 사용)
+#     affinity_matrix = rbf_kernel(cls_outputs_np)
+    
+#     # 스펙트럴 클러스터링 수행
+#     spectral = SpectralClustering(
+#         n_clusters=n_clusters,
+#         random_state=random_seed,
+#         affinity='precomputed',  # 미리 계산된 유사도 행렬 사용
+#         assign_labels='kmeans'    # 최종 클러스터 할당에 k-means 사용
+#     )
+#     cluster_labels = spectral.fit_predict(affinity_matrix)
+    
+#     # 각 클러스터의 중심점 계산
+#     cluster_centers = []
+#     for i in range(n_clusters):
+#         cluster_points = cls_outputs_np[cluster_labels == i]
+#         if len(cluster_points) > 0:  # 빈 클러스터 방지
+#             center = cluster_points.mean(axis=0)
+#             cluster_centers.append(center)
+    
+#     cluster_centers = np.array(cluster_centers)
+    
+#     return spectral, cluster_centers
             
             
 #%%
@@ -1213,11 +1347,13 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
         if epoch % log_interval == 0:
-            # kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
-            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
-            cluster_centers = train_cls_outputs.mean(dim=0)
-            cluster_centers = cluster_centers.detach().cpu().numpy()
+            kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
             cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            # cluster_centers = train_cls_outputs.mean(dim=0)
+            # cluster_centers = cluster_centers.detach().cpu().numpy()
+            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            # spectral, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
+            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
 
             auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
             

@@ -2,10 +2,14 @@
 
 # python argparse source for experiments
 experiments=(
-"--random-seed 1 --epochs 300 --learning-rate 0.0001"
-"--dataset-name BZR --random-seed 1 --epochs 500 --learning-rate 0.0001"
-"--dataset-name DHFR --random-seed 1 --epochs 300 --learning-rate 0.0001"
-"--dataset-name AIDS --random-seed 1 --epochs 200 --learning-rate 0.0001"
+"--random-seed 1 --n-cluster 5 --epochs 300 --learning-rate 0.0001"
+"--dataset-name BZR --random-seed 1 --n-cluster 5 --epochs 500 --learning-rate 0.0001"
+"--dataset-name DHFR --random-seed 1 --n-cluster 5 --epochs 300 --learning-rate 0.0001"
+"--dataset-name AIDS --random-seed 1 --n-cluster 5 --epochs 200 --learning-rate 0.0001"
+"--random-seed 1 --n-cluster 7 --epochs 300 --learning-rate 0.0001"
+"--dataset-name BZR --random-seed 1 --n-cluster 7 --epochs 500 --learning-rate 0.0001"
+"--dataset-name DHFR --random-seed 1 --n-cluster 7 --epochs 300 --learning-rate 0.0001"
+"--dataset-name AIDS --random-seed 1 --n-cluster 7 --epochs 200 --learning-rate 0.0001"
 )
 
 # default prefix of job name
@@ -29,9 +33,9 @@ RUN_SRC=./run_src.sh
 ENV=/home1/rldnjs16/ENTER/envs/graph/bin/python3
 
 # file directory of experiment ".py"
-EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model9.py
+EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model10.py
 
 for index in ${!experiments[*]}; do
-    sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[6]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 
+    sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[1]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 
     sleep 1
 done
