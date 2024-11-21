@@ -78,12 +78,7 @@ def train(model, train_loader, recon_optimizer, max_nodes, device):
     model.train()
     total_loss = 0
     num_sample = 0
-    
-    # # BERT 인코더의 파라미터는 고정
-    # model.encoder.eval()
-    # for param in model.encoder.parameters():
-    #     param.requires_grad = True
-        
+            
     for data in train_loader:
         recon_optimizer.zero_grad()
         data = data.to(device)

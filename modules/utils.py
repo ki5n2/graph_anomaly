@@ -414,7 +414,9 @@ def get_data_loaders_TU(dataset_name, batch_size, test_batch_size, split, datase
     (train_index, test_index) = split
     data_train_ = [data_list[i] for i in train_index]
     data_test = [data_list[i] for i in test_index]
-
+    
+    print(f'len train_ {len(data_train_)}')
+    
     data_train = []
     if dataset_AN:
         for data in data_train_:
@@ -431,11 +433,13 @@ def get_data_loaders_TU(dataset_name, batch_size, test_batch_size, split, datase
             data.y = 0
             data['idx'] = idx
             idx += 1
+    print(f'len train {len(data_train)}')
     
     if dataset_AN:
         for data in data_test:
             data.y = 1 if data.y == 0 else 0
-
+    print(f'len test {len(data_test)}')
+    
     max_nodes = max([dataset[i].num_nodes for i in range(len(dataset))])
     dataloader = DataLoader(data_train, batch_size, shuffle=True)
     dataloader_test = DataLoader(data_test, test_batch_size, shuffle=True)

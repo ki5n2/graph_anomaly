@@ -36,10 +36,12 @@ from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
 from scipy.stats import wasserstein_distance
-from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score
+from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score, silhouette_score, silhouette_samples
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
-from sklearn.metrics.pairwise import rbf_kernel
+from sklearn.metrics.pairwise import rbf_kernel, cosine_similarity
 from sklearn.cluster import SpectralClustering
+from sklearn.neighbors import kneighbors_graph
+from sklearn.manifold import SpectralEmbedding
 
 from functools import partial
 from scipy.linalg import eigh
@@ -84,241 +86,6 @@ def train_bert_embedding(model, train_loader, bert_optimizer, device):
 
 
 #%%
-# def train_bert_embedding_(model, train_loader, bert_optimizer, device):
-#     model.train()
-#     total_loss = 0
-#     num_sample = 0
-    
-#     for data in train_loader:
-#         bert_optimizer.zero_grad()
-#         data = data.to(device)
-#         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-        
-#         adj = adj_original(edge_index, batch, max_nodes)
-        
-#         # BERT 인코딩 및 마스크 토큰 예측만 수행
-#         _, _, adj_recon_list = model(
-#             x, edge_index, batch, num_graphs, training=True, edge_training=True
-#         )
-
-#         loss = 0
-#         start_node = 0
-#         for i in range(num_graphs):
-#             num_nodes = (batch == i).sum().item()
-#             end_node = start_node + num_nodes
-            
-#             adj_loss = torch.norm(adj_recon_list[i] - adj[i], p='fro')**2 / num_nodes
-#             adj_loss = adj_loss / 20
-#             loss += adj_loss
-            
-#             start_node = end_node
-            
-#         print(f'edge_loss:{loss}')
-#         # print(f'mask_label:{mask_loss_}')
-        
-#         loss.backward()
-#         bert_optimizer.step()
-#         total_loss += loss.item()
-#         num_sample += num_graphs
-    
-#     return total_loss / len(train_loader), num_sample
-
-
-# def train(model, train_loader, recon_optimizer, max_nodes, device):
-#     model.train()
-#     total_loss = 0
-#     total_recon_loss = 0
-#     total_cls_loss = 0
-#     num_sample = 0
-    
-#     for data in train_loader:
-#         recon_optimizer.zero_grad()
-#         data = data.to(device)
-#         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-        
-#         train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
-        
-#         recon_loss = 0
-#         start_node = 0
-#         for i in range(num_graphs):
-#             num_nodes = (batch == i).sum().item()
-#             end_node = start_node + num_nodes
-
-#             node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-            
-#             recon_loss += node_loss
-
-#             start_node = end_node
-                
-#         # CLS Similarity Loss
-#         if num_graphs > 1:  # 배치에 2개 이상의 그래프가 있을 때만 계산
-#             # 1. Pairwise Distance Matrix 계산
-#             cls_distances = torch.cdist(train_cls_outputs, train_cls_outputs, p=2)  # [num_graphs, num_graphs]
-            
-#             # 2. 대각선 요소 제외 (자기 자신과의 거리)
-#             mask = ~torch.eye(num_graphs, dtype=bool, device=device)
-#             cls_distances = cls_distances[mask]
-            
-#             # 3. 평균 거리 계산
-#             cls_loss = cls_distances.mean()
-#         else:
-#             cls_loss = torch.tensor(0.0, device=device)
-                
-#         # Total Loss (alpha는 CLS 손실의 가중치)
-#         alpha = 100.0  # 이 값은 조정 가능
-#         cls_loss = alpha * cls_loss
-#         loss = recon_loss + cls_loss
-            
-#         num_sample += num_graphs
-#         loss.backward()
-#         recon_optimizer.step()
-        
-#         total_loss += loss.item()
-#         total_recon_loss += recon_loss.item()
-#         total_cls_loss += cls_loss.item()
-        
-#         print(f'train_recon_loss: {recon_loss.item():.4f}, train_cls_loss: {cls_loss.item():.4f}')
-
-#     avg_loss = total_loss / len(train_loader)
-#     avg_recon_loss = total_recon_loss / len(train_loader)
-#     avg_cls_loss = total_cls_loss / len(train_loader)
-    
-#     print(f'Average reconstruction loss: {avg_recon_loss:.4f}')
-#     print(f'Average CLS similarity loss: {avg_cls_loss:.4f}')        
-        
-#     return avg_loss, num_sample, train_cls_outputs.detach().cpu()
-
-
-# def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
-#     model.eval()
-#     total_loss_ = 0
-#     total_loss_anomaly_ = 0
-#     all_labels = []
-#     all_scores = []
-#     reconstruction_errors = []  # 새로 추가
-    
-#     # 정규화를 위한 최대/최소값 초기화
-#     max_node_loss = float('-inf')
-#     min_node_loss = float('inf')
-#     max_cluster_dist = float('-inf')
-#     min_cluster_dist = float('inf')
-    
-#     with torch.no_grad():
-#         for data in test_loader:
-#             data = data.to(device)
-#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
-            
-#             start_node = 0
-#             for i in range(num_graphs):
-#                 num_nodes = (batch == i).sum().item()
-#                 end_node = start_node + num_nodes
-                
-#                 # Reconstruction error 계산
-#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-#                 node_loss = node_loss.item()
-                
-#                 # Clustering distance 계산
-#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
-#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-#                 min_distance = distances.min()
-                
-#                 # 최대/최소값 업데이트
-#                 max_node_loss = max(max_node_loss, node_loss)
-#                 min_node_loss = min(min_node_loss, node_loss)
-#                 max_cluster_dist = max(max_cluster_dist, min_distance)
-#                 min_cluster_dist = min(min_cluster_dist, min_distance)
-                    
-#                 start_node = end_node
-                    
-    
-#     # 두 번째 패스: 정규화된 값으로 평가
-#     with torch.no_grad():
-#         for data in test_loader:
-#             data = data.to(device)
-#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
-            
-#             recon_errors = []
-#             start_node = 0
-            
-#             for i in range(num_graphs):
-#                 num_nodes = (batch == i).sum().item()
-#                 end_node = start_node + num_nodes
-                
-#                 # Reconstruction error 계산 및 정규화 (0~1)
-#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-#                 node_loss = node_loss.item()
-#                 normalized_node_loss = (node_loss - min_node_loss) / (max_node_loss - min_node_loss)
-                
-#                 # Clustering distance 계산 및 정규화 (0~1)
-#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
-#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-#                 min_distance = distances.min().item()
-#                 normalized_cluster_dist = (min_distance - min_cluster_dist) / (max_cluster_dist - min_cluster_dist)
-                
-#                 # 정규화된 에러값들 저장
-#                 reconstruction_errors.append({
-#                     'reconstruction': normalized_node_loss,
-#                     'clustering': normalized_cluster_dist,
-#                     'is_anomaly': data.y[i].item() == 1
-#                 })
-                
-#                 # 전체 에러는 정규화된 값들의 평균으로 계산
-#                 total_error = (normalized_node_loss * 10) + (normalized_cluster_dist * 5)
-#                 print(f'normalized node loss: {normalized_node_loss * 10}')
-#                 print(f'normalized cluster dist: {normalized_cluster_dist * 5}')
-#                 recon_errors.append(total_error)
-                
-#                 if data.y[i].item() == 0:
-#                     total_loss_ += total_error
-#                 else:
-#                     total_loss_anomaly_ += total_error
-                    
-#                 start_node = end_node
-            
-#             all_scores.extend(recon_errors)
-#             all_labels.extend(data.y.cpu().numpy())
-    
-#     # 시각화를 위한 데이터 변환
-#     visualization_data = {
-#         'normal': [
-#             {'reconstruction': error['reconstruction'], 
-#              'clustering': error['clustering']}
-#             for error in reconstruction_errors if not error['is_anomaly']
-#         ],
-#         'anomaly': [
-#             {'reconstruction': error['reconstruction'], 
-#              'clustering': error['clustering']}
-#             for error in reconstruction_errors if error['is_anomaly']
-#         ]
-#     }
-    
-#     # 메트릭 계산
-#     all_labels = np.array(all_labels)
-#     all_scores = np.array(all_scores)
-    
-#     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
-#     auroc = auc(fpr, tpr)
-#     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
-#     auprc = auc(recall, precision)
-    
-#     # 최적 임계값 찾기
-#     optimal_idx = np.argmax(tpr - fpr)
-#     optimal_threshold = thresholds[optimal_idx]
-#     pred_labels = (all_scores > optimal_threshold).astype(int)
-    
-#     precision = precision_score(all_labels, pred_labels)
-#     recall = recall_score(all_labels, pred_labels)
-#     f1 = f1_score(all_labels, pred_labels)
-    
-#     total_loss_mean = total_loss_ / sum(all_labels == 0)
-#     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-    
-#     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
-
-
-#%%
 def train(model, train_loader, recon_optimizer, max_nodes, device, epoch):
     model.train()
     total_loss = 0
@@ -333,10 +100,10 @@ def train(model, train_loader, recon_optimizer, max_nodes, device, epoch):
         train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
-            cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed, n_init="auto").fit(cls_outputs_np)
-            cluster_centers = kmeans.cluster_centers_
-        
+            cluster_centers = train_cls_outputs.mean(dim=0)
+            cluster_centers = cluster_centers.detach().cpu().numpy()
+            cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            
         loss = 0
         start_node = 0
         for i in range(num_graphs):
@@ -397,127 +164,46 @@ def train(model, train_loader, recon_optimizer, max_nodes, device, epoch):
 
 
 #%%
-# def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
-#     model.eval()
-#     total_loss_ = 0
-#     total_loss_anomaly_ = 0
-#     all_labels = []
-#     all_scores = []
-#     reconstruction_errors = []  # 새로 추가
-    
-#     with torch.no_grad():
-#         for data in test_loader:
-#             data = data.to(device)
-#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-#             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
-            
-#             recon_errors = []
-#             start_node = 0
-#             for i in range(num_graphs):
-#                 num_nodes = (batch == i).sum().item()
-#                 end_node = start_node + num_nodes
-                
-#                 # Reconstruction error 계산
-#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-#                 node_loss = node_loss.item()
-#                 scaled_node_loss = torch.sigmoid(torch.tensor(node_loss)).item() * 10
-
-#                 # Clustering distance 계산 후 시그모이드 적용
-#                 cls_vec = e_cls_output[i].detach().cpu().numpy()
-#                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-#                 min_distance = distances.min().item()
-#                 scaled_cluster_dist = torch.sigmoid(torch.tensor(min_distance)).item() * 5
-                
-#                 # 변환된 값들 저장
-#                 reconstruction_errors.append({
-#                     'reconstruction': scaled_node_loss,
-#                     'clustering': scaled_cluster_dist,
-#                     'is_anomaly': data.y[i].item() == 1
-#                 })
-
-#                 # 전체 에러는 변환된 값들의 평균으로 계산
-#                 total_error = scaled_node_loss + scaled_cluster_dist
-#                 recon_errors.append(total_error)
-                
-#                 print(f'scaled_node_loss:{scaled_node_loss}')
-#                 print(f'scaled_cluster_dist:{scaled_cluster_dist}')
-                
-#                 if data.y[i].item() == 0:
-#                     total_loss_ += total_error
-#                 else:
-#                     total_loss_anomaly_ += total_error
-                    
-#                 start_node = end_node
-            
-#             all_scores.extend(recon_errors)
-#             all_labels.extend(data.y.cpu().numpy())
-    
-#     # 시각화를 위한 데이터 변환
-#     visualization_data = {
-#         'normal': [
-#             {'reconstruction': error['reconstruction'], 
-#              'clustering': error['clustering']}
-#             for error in reconstruction_errors if not error['is_anomaly']
-#         ],
-#         'anomaly': [
-#             {'reconstruction': error['reconstruction'], 
-#              'clustering': error['clustering']}
-#             for error in reconstruction_errors if error['is_anomaly']
-#         ]
-#     }
-    
-#     # 메트릭 계산
-#     all_labels = np.array(all_labels)
-#     all_scores = np.array(all_scores)
-    
-#     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
-#     auroc = auc(fpr, tpr)
-#     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
-#     auprc = auc(recall, precision)
-    
-#     # 최적 임계값 찾기
-#     optimal_idx = np.argmax(tpr - fpr)
-#     optimal_threshold = thresholds[optimal_idx]
-#     pred_labels = (all_scores > optimal_threshold).astype(int)
-    
-#     precision = precision_score(all_labels, pred_labels)
-#     recall = recall_score(all_labels, pred_labels)
-#     f1 = f1_score(all_labels, pred_labels)
-    
-#     total_loss_mean = total_loss_ / sum(all_labels == 0)
-#     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-
-#     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
-
-
-def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
+def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, device):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
     all_labels = []
     all_scores = []
     reconstruction_errors = []  # 새로 추가
-
+    
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
             e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            
+            e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
+            spectral_embedder_test = SpectralEmbedding(
+                n_components=n_clusters, 
+                affinity='rbf', 
+                gamma=gamma_clusters,
+                random_state=random_seed
+            )
 
+            spectral_embeddings_test = spectral_embedder_test.fit_transform(e_cls_outputs_np)  # [num_graphs, k]
+            
             recon_errors = []
             start_node = 0
+            
             for i in range(num_graphs):
                 num_nodes = (batch == i).sum().item()
                 end_node = start_node + num_nodes
                 
+                # Reconstruction error 계산
                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
                 node_loss = node_loss.item() * alpha
-                
-                # cls_vec = e_cls_output[i].cpu().numpy()  # [hidden_dim]
-                cls_vec = e_cls_output[i].detach().cpu().numpy()  # [hidden_dim]
-                distances = cdist([cls_vec], cluster_centers, metric='euclidean')  # [1, n_clusters]
+                transformed_cls_vec = spectral_embeddings_test[i]  # [k]
+                transformed_cls_vec = np.reshape(transformed_cls_vec, (1, -1))  # 또는 transformed_cls_vec[None, :]
+                distances = cdist(transformed_cls_vec, cluster_centers, metric='euclidean')
+                # distances = cdist([transformed_cls_vec], cluster_centers, metric='euclidean')  # [1, n_clusters]
                 min_distance = distances.min().item() * gamma
-
+                
                 # 변환된 값들 저장
                 reconstruction_errors.append({
                     'reconstruction': node_loss,
@@ -525,22 +211,23 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
                     'is_anomaly': data.y[i].item() == 1
                 })
 
+                # 전체 에러는 변환된 값들의 평균으로 계산
                 recon_error = node_loss + min_distance              
                 recon_errors.append(recon_error)
                 
                 print(f'test_node_loss: {node_loss}')
                 print(f'test_min_distance: {min_distance}')
-
+                
                 if data.y[i].item() == 0:
                     total_loss_ += recon_error
                 else:
                     total_loss_anomaly_ += recon_error
-
+                    
                 start_node = end_node
             
             all_scores.extend(recon_errors)
             all_labels.extend(data.y.cpu().numpy())
-
+    
     # 시각화를 위한 데이터 변환
     visualization_data = {
         'normal': [
@@ -558,25 +245,24 @@ def evaluate_model(model, test_loader, max_nodes, cluster_centers, device):
     # 메트릭 계산
     all_labels = np.array(all_labels)
     all_scores = np.array(all_scores)
-
-    # Compute metrics
+    
     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
     auroc = auc(fpr, tpr)
     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
     auprc = auc(recall, precision)
-
+    
     # 최적 임계값 찾기
     optimal_idx = np.argmax(tpr - fpr)
     optimal_threshold = thresholds[optimal_idx]
     pred_labels = (all_scores > optimal_threshold).astype(int)
-
+    
     precision = precision_score(all_labels, pred_labels)
     recall = recall_score(all_labels, pred_labels)
     f1 = f1_score(all_labels, pred_labels)
-
+    
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-    
+
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, visualization_data
 
 
@@ -715,7 +401,7 @@ parser.add_argument("--n-layer", type=int, default=2)
 parser.add_argument("--BERT-epochs", type=int, default=100)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--patience", type=int, default=5)
-parser.add_argument("--n-cluster", type=int, default=5)
+parser.add_argument("--n-cluster", type=int, default=1)
 parser.add_argument("--step-size", type=int, default=20)
 parser.add_argument("--n-cross-val", type=int, default=5)
 parser.add_argument("--random-seed", type=int, default=1)
@@ -734,6 +420,7 @@ parser.add_argument("--learning-rate", type=float, default=0.0001)
 parser.add_argument("--alpha", type=float, default=1.0)
 parser.add_argument("--beta", type=float, default=0.05)
 parser.add_argument("--gamma", type=float, default=0.1)
+parser.add_argument("--gamma-cluster", type=float, default=0.5)
 parser.add_argument("--node-theta", type=float, default=0.03)
 parser.add_argument("--adj-theta", type=float, default=0.01)
 
@@ -775,6 +462,7 @@ learning_rate: float = args.learning_rate
 alpha: float = args.alpha
 beta: float = args.beta
 gamma: float = args.gamma
+gamma_cluster: float = args.gamma_cluster
 node_theta: float = args.node_theta
 adj_theta: float = args.adj_theta
 
@@ -1169,52 +857,125 @@ class TransformerEncoder(nn.Module):
     
 
 #%%
-def perform_clustering(train_cls_outputs, random_seed, n_clusters):
-    cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-    kmeans = KMeans(n_clusters=n_clusters, random_state=random_seed, n_init="auto").fit(cls_outputs_np)
-    return kmeans, kmeans.cluster_centers_
-
-
-# def perform_clustering(train_cls_outputs, random_seed, n_clusters):
-#     """
-#     스펙트럴 클러스터링을 수행하는 함수
+class ClusteringAnalyzer:
+    def __init__(self, n_clusters, random_seed, gamma_clusters):
+        self.n_clusters = n_clusters
+        self.random_seed = random_seed
+        self.gamma_clusters = gamma_clusters
+        
+    def perform_clustering_with_analysis(self, train_cls_outputs, epoch):
+        """
+        클러스터링 수행 및 분석을 위한 통합 함수
+        """
+        # CPU로 이동 및 Numpy 배열로 변환
+        cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
+        
+        # 스펙트럴 임베딩 생성
+        spectral_embedder = SpectralEmbedding(
+            n_components=self.n_clusters, 
+            affinity='rbf', 
+            gamma=self.gamma_clusters,
+            random_state=self.random_seed
+        )
+        spectral_embeddings = spectral_embedder.fit_transform(cls_outputs_np)
+        
+        # k-평균 클러스터링 수행
+        kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_seed)
+        cluster_labels = kmeans.fit_predict(spectral_embeddings)
+        
+        # Silhouette Score 계산
+        if len(np.unique(cluster_labels)) > 1:  # 클러스터가 2개 이상일 때만 계산
+            sil_score = silhouette_score(spectral_embeddings, cluster_labels)
+            sample_silhouette_values = silhouette_samples(spectral_embeddings, cluster_labels)
+        else:
+            sil_score = 0
+            sample_silhouette_values = np.zeros(len(cluster_labels))
+        
+        # 시각화
+        self._plot_silhouette_analysis(spectral_embeddings, cluster_labels, 
+                                     sample_silhouette_values, sil_score, epoch)
+        
+        cluster_centers = kmeans.cluster_centers_
+        
+        clustering_metrics = {
+            'silhouette_score': sil_score,
+            'sample_silhouette_values': sample_silhouette_values.tolist(),
+            'cluster_sizes': [sum(cluster_labels == i) for i in range(self.n_clusters)],
+            'n_clusters': self.n_clusters
+        }
+        
+        return spectral_embedder, cluster_centers, clustering_metrics
     
-#     Args:
-#         train_cls_outputs: 학습 데이터의 CLS 토큰 출력값
-#         random_seed: 랜덤 시드
-#         n_clusters: 클러스터 수
-    
-#     Returns:
-#         spectral: 학습된 스펙트럴 클러스터링 모델
-#         cluster_centers: 각 클러스터의 중심점
-#     """
-#     # CPU로 이동 및 Numpy 배열로 변환
-#     cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-    
-#     # 유사도 행렬 계산 (RBF 커널 사용)
-#     affinity_matrix = rbf_kernel(cls_outputs_np)
-    
-#     # 스펙트럴 클러스터링 수행
-#     spectral = SpectralClustering(
-#         n_clusters=n_clusters,
-#         random_state=random_seed,
-#         affinity='precomputed',  # 미리 계산된 유사도 행렬 사용
-#         assign_labels='kmeans'    # 최종 클러스터 할당에 k-means 사용
-#     )
-#     cluster_labels = spectral.fit_predict(affinity_matrix)
-    
-#     # 각 클러스터의 중심점 계산
-#     cluster_centers = []
-#     for i in range(n_clusters):
-#         cluster_points = cls_outputs_np[cluster_labels == i]
-#         if len(cluster_points) > 0:  # 빈 클러스터 방지
-#             center = cluster_points.mean(axis=0)
-#             cluster_centers.append(center)
-    
-#     cluster_centers = np.array(cluster_centers)
-    
-#     return spectral, cluster_centers
+    def _plot_silhouette_analysis(self, X, cluster_labels, sample_silhouette_values, 
+                                 silhouette_avg, epoch):
+        """
+        실루엣 분석 결과 시각화
+        """
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
+        
+        # 첫 번째 그래프: 실루엣 플롯
+        y_lower = 10
+        for i in range(self.n_clusters):
+            ith_cluster_silhouette_values = sample_silhouette_values[cluster_labels == i]
+            ith_cluster_silhouette_values.sort()
             
+            size_cluster_i = ith_cluster_silhouette_values.shape[0]
+            y_upper = y_lower + size_cluster_i
+            
+            color = plt.cm.nipy_spectral(float(i) / self.n_clusters)
+            ax1.fill_betweenx(np.arange(y_lower, y_upper),
+                            0, ith_cluster_silhouette_values,
+                            facecolor=color, alpha=0.7)
+            
+            ax1.text(-0.05, y_lower + 0.5 * size_cluster_i, f'Cluster {i}')
+            y_lower = y_upper + 10
+            
+        ax1.set_title("Silhouette plot for the clusters")
+        ax1.set_xlabel("Silhouette coefficient values")
+        ax1.set_ylabel("Cluster label")
+        ax1.axvline(x=silhouette_avg, color="red", linestyle="--",
+                   label=f'Average silhouette score: {silhouette_avg:.3f}')
+        ax1.set_yticks([])
+        ax1.set_xlim([-1, 1])
+        ax1.legend()
+        
+        # 두 번째 그래프: 클러스터 산점도
+        colors = plt.cm.nipy_spectral(cluster_labels.astype(float) / self.n_clusters)
+        ax2.scatter(X[:, 0], X[:, 1], marker='.', s=100, lw=0, alpha=0.7,
+                   c=colors, edgecolor='k')
+        
+        # Add labels and title
+        ax2.set_title("Visualization of the clustered data")
+        ax2.set_xlabel("First embedded dimension")
+        ax2.set_ylabel("Second embedded dimension")
+        
+        plt.suptitle(f"Silhouette Analysis for K-means Clustering on Sample Data "
+                    f"with n_clusters = {self.n_clusters}\n"
+                    f"Silhouette Score: {silhouette_avg:.3f}",
+                    fontsize=14, fontweight='bold')
+        
+        # 저장 경로 설정 및 저장
+        save_path = f'/home1/rldnjs16/graph_anomaly_detection/silhouette_analysis/silhouette_analysis_epoch_{epoch}.png'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        plt.close()
+
+
+# perform_clustering 함수를 대체
+def perform_clustering(train_cls_outputs, random_seed, n_clusters, gamma_clusters, epoch):
+    analyzer = ClusteringAnalyzer(n_clusters, random_seed, gamma_clusters)
+    spectral_embedder, cluster_centers, clustering_metrics = analyzer.perform_clustering_with_analysis(
+        train_cls_outputs, epoch)
+    
+    # wandb에 메트릭 기록
+    wandb.log({
+        'silhouette_score': clustering_metrics['silhouette_score'],
+        'cluster_sizes': clustering_metrics['cluster_sizes'],
+        'epoch': epoch
+    })
+    
+    return spectral_embedder, cluster_centers, clustering_metrics
+
             
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
@@ -1354,26 +1115,15 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
 
         pretrain_params = list(model.encoder.parameters())
         bert_optimizer = torch.optim.Adam(pretrain_params, lr=learning_rate)
-        # bert_scheduler = ReduceLROnPlateau(bert_optimizer, mode='min', factor=factor, patience=patience)
-    
+        
         for epoch in range(1, BERT_epochs+1):
             train_loss, num_sample = train_bert_embedding(
                 model, train_loader, bert_optimizer, device
             )
-            # bert_scheduler.step(train_loss)
             
             if epoch % log_interval == 0:
                 print(f'BERT Training Epoch {epoch}: Loss = {train_loss:.4f}')
         
-        # for epoch in range(1, BERT_epochs+1):
-        #     train_adj_loss, num_sample_ = train_bert_embedding_(
-        #         model, train_loader, bert_optimizer, device
-        #     )
-        #     # bert_scheduler.step(train_loss)
-            
-        #     if epoch % log_interval == 0:
-        #         print(f'BERT Edge Training Epoch {epoch}: Loss = {train_adj_loss:.4f}')
-                      
         # 학습된 BERT 저장
         print("Saving pretrained BERT...")
         torch.save(model.encoder.state_dict(), bert_save_path)
@@ -1389,16 +1139,27 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
         if epoch % log_interval == 0:
-            kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
-            cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            # kmeans, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
+            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            
             # cluster_centers = train_cls_outputs.mean(dim=0)
             # cluster_centers = cluster_centers.detach().cpu().numpy()
             # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
-            # spectral, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster)
-            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
-
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
             
+            # spectral, cluster_centers = perform_clustering(train_cls_outputs, random_seed, n_clusters=n_cluster, gamma_clusters=gamma_cluster)
+            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
+            spectral, cluster_centers, clustering_metrics = perform_clustering(
+                train_cls_outputs, random_seed, n_clusters=n_cluster, 
+                gamma_clusters=gamma_cluster, epoch=epoch
+            )
+
+            print(f"\nClustering Analysis Results (Epoch {epoch}):")
+            print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
+            print(f"silhouette_score: {clustering_metrics['silhouette_score']:.4f}")
+            
+            # auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, max_nodes, cluster_centers, device)
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, visualization_data = evaluate_model(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, device)
+
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
             os.makedirs(os.path.dirname(save_path_), exist_ok=True)
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/'
