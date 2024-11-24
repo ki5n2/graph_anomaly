@@ -2,16 +2,10 @@
 
 # python argparse source for experiments
 experiments=(
-"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 3 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 5 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 7 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 30 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 40 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 3 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 5 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 7 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 25 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
-"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 35 --gamma-cluster 0.5 --learning-rate 0.0001 --gamma 0.1"
+"--random-seed 1 --epochs 150 --n-cluster 3 --learning-rate 0.0001"
+"--dataset-name BZR --random-seed 1 --epochs 500 --n-cluster 3 --learning-rate 0.0001"
+"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 3 --learning-rate 0.0001"
+"--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 3 --learning-rate 0.0001"
 )
 
 # default prefix of job name
@@ -35,7 +29,7 @@ RUN_SRC=./run_src.sh
 ENV=/home1/rldnjs16/ENTER/envs/graph/bin/python3
 
 # file directory of experiment ".py"
-EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model10.py
+EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model14_.py
 
 for index in ${!experiments[*]}; do
     sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[1]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 

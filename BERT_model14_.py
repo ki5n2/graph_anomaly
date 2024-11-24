@@ -1057,12 +1057,12 @@ class GRAPH_AUTOENCODER(nn.Module):
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
 
         # 위상학적 특성 추출기와 CLS 헤드 추가
-        # self.topo_extractor = TopologicalFeatureExtractor(max_dim=1)
-        # self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], 8)  # 8 = 2차원 * 4특성
+        self.topo_extractor = TopologicalFeatureExtractor(max_dim=1)
+        self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], 8)  # 8 = 2차원 * 4특성
         
-        self.topo_extractor = TopologicalFeatureExtractor_(max_dim=1, n_bins=10)
-        topo_feature_dim = (1 + 1) * (10 + 3)  # = 26 차원
-        self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], topo_feature_dim)
+        # self.topo_extractor = TopologicalFeatureExtractor_(max_dim=1, n_bins=10)
+        # topo_feature_dim = (1 + 1) * (10 + 3)  # = 26 차원
+        # self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], topo_feature_dim)
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
         # BERT 인코딩
