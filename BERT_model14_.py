@@ -46,8 +46,11 @@ from sklearn.manifold import SpectralEmbedding
 from sklearn.preprocessing import StandardScaler
 
 from functools import partial
-from scipy.linalg import eigh
 from multiprocessing import Pool
+
+from scipy.linalg import eigh
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
 from modules.loss import loss_cal
 from modules.utils import set_seed, set_device, EarlyStopping, get_ad_split_TU, get_data_loaders_TU, adj_original
@@ -94,15 +97,31 @@ def train(model, train_loader, recon_optimizer, device, epoch):
     num_sample = 0
     reconstruction_errors = []
     
+    homology_calculator = GraphHomologyCalculator(max_dimension=2)
+
     for data in train_loader:
         recon_optimizer.zero_grad()
         data = data.to(device)
         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
         
-        train_cls_outputs, x_recon, topo_pred = model(x, edge_index, batch, num_graphs)
         
-        # 위상학적 손실 계산
-        topo_loss = calculate_topology_loss(model, data, topo_pred, device)
+        # 각 그래프의 호몰로지 계산
+        homology_features = []
+        start_idx = 0
+        for i in range(num_graphs):
+            mask = (batch == i)
+            num_nodes = mask.sum().item()
+            graph_edge_index = edge_index[:, (edge_index[0] >= start_idx) & (edge_index[0] < start_idx + num_nodes)]
+            graph_edge_index = graph_edge_index - start_idx
+            
+            features = homology_calculator.compute_graph_homology(graph_edge_index, num_nodes)
+            homology_features.append(features)
+            start_idx += num_nodes
+            
+        homology_features = torch.tensor(np.stack(homology_features), device=device)
+        
+        
+        train_cls_outputs, x_recon, homology_pred = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
             cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
@@ -113,12 +132,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
         loss = 0
         node_loss = 0
         start_node = 0
-        # topo_loss = 0
-        # start_idx = 0
         for i in range(num_graphs):
-            # 현재 그래프에 해당하는 노드 마스크 생성
-            graph_mask = (data.batch == i)
-            
             num_nodes = (batch == i).sum().item()
             end_node = start_node + num_nodes
 
@@ -136,24 +150,13 @@ def train(model, train_loader, recon_optimizer, device, epoch):
                     'clustering': min_distance,
                     'type': 'train_normal'  # 훈련 데이터는 모두 정상
                 })
-                
         
             start_node = end_node
-            
-            # # 현재 그래프의 edge_index 추출
-            # graph_edges = data.edge_index[:, graph_mask[data.edge_index[0]] & graph_mask[data.edge_index[1]]]
-            # graph_edges = graph_edges - start_idx
-            
-            # # 위상학적 특성 계산
-            # topo_features = model.topo_extractor.extract_persistence_features(
-            # graph_edges, num_nodes).to(device)
-
-            # # MSE 손실 계산
-            # topo_loss_ = F.mse_loss(topo_pred[i], topo_features)
-            # topo_loss += topo_loss_
-            # start_idx += num_nodes
-
-        loss = node_loss + topo_loss
+        
+        homo_loss = F.mse_loss(homology_pred, homology_features)
+        print(f'node_loss: {node_loss}')
+        print(f'homo_loss: {homo_loss}')
+        loss = node_loss + homo_loss
         num_sample += num_graphs
         loss.backward()
         recon_optimizer.step()
@@ -163,7 +166,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
 
 
 #%%
-def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, epoch, trial, reconstruction_errors, device):
+def evaluate_model_with_density(model, test_loader, cluster_centers, reconstruction_errors, device):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
@@ -175,7 +178,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon, topo_pred = model(x, edge_index, batch, num_graphs)
+            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
             
             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()
             
@@ -272,33 +275,6 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
 
 
-def calculate_topology_loss(model, data, topo_pred, device):
-    batch_size = data.num_graphs
-    total_loss = 0
-    
-    start_idx = 0
-    for i in range(batch_size):
-        # 현재 그래프에 해당하는 노드 마스크 생성
-        graph_mask = (data.batch == i)
-        num_nodes = graph_mask.sum().item()
-        
-        # 현재 그래프의 edge_index 추출
-        graph_edges = data.edge_index[:, graph_mask[data.edge_index[0]] & graph_mask[data.edge_index[1]]]
-        graph_edges = graph_edges - start_idx
-        
-        # 위상학적 특성 계산
-        topo_features = model.topo_extractor.extract_persistence_features(
-            graph_edges, num_nodes).to(device)
-        
-        # MSE 손실 계산 (차원이 일치하는지 확인)
-        loss = F.mse_loss(topo_pred[i], topo_features)
-        total_loss += loss
-        
-        start_idx += num_nodes
-    
-    return total_loss / batch_size
-
-
 #%%
 class DensityBasedScoring:
     def __init__(self, bandwidth=0.5):
@@ -336,184 +312,6 @@ class DensityBasedScoring:
         
         return anomaly_scores
     
-
-class TopologicalFeatureExtractor:
-    def __init__(self, max_dim=1, max_death_value=float('inf')):
-        self.max_dim = max_dim
-        self.max_death_value = max_death_value
-        
-    def extract_persistence_features(self, edge_index, num_nodes):
-        # 거리 행렬 계산
-        adj_matrix = to_dense_adj(edge_index)[0].cpu().numpy()
-        dist_matrix = self._compute_distance_matrix(adj_matrix, num_nodes)
-        
-        # Rips complex를 사용하여 persistent homology 계산
-        rips_complex = gd.RipsComplex(distance_matrix=dist_matrix)
-        simplex_tree = rips_complex.create_simplex_tree(max_dimension=self.max_dim)
-        
-        # 퍼시스턴스 다이어그램 계산
-        persistence = simplex_tree.persistence()
-        
-        # 각 차원별 위상학적 특성 추출
-        features = []
-        for dim in range(self.max_dim + 1):
-            dim_features = self._extract_dimension_features(persistence, dim)
-            features.extend(dim_features)
-            
-        return torch.tensor(features, dtype=torch.float)
-    
-    def _compute_distance_matrix(self, adj_matrix, num_nodes):
-        G = nx.from_numpy_array(adj_matrix)
-        dist_matrix = np.zeros((num_nodes, num_nodes))
-        
-        # Floyd-Warshall 알고리즘으로 최단 경로 거리 계산
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i != j:
-                    try:
-                        dist_matrix[i,j] = nx.shortest_path_length(G, source=i, target=j)
-                    except nx.NetworkXNoPath:
-                        dist_matrix[i,j] = self.max_death_value
-                        
-        return dist_matrix
-    
-    def _extract_dimension_features(self, persistence, dim):
-        # 해당 차원의 persistence pairs 추출
-        pairs = [(birth, death) for (d, (birth, death)) in persistence if d == dim and death != float('inf')]
-        
-        if not pairs:
-            return [0.0] * 4  # 기본 특성값
-            
-        pairs = np.array(pairs)
-        
-        features = [
-            len(pairs),  # 해당 차원의 위상학적 특성 수
-            np.mean(pairs[:,1] - pairs[:,0]),  # 평균 수명
-            np.max(pairs[:,1] - pairs[:,0]) if len(pairs) > 0 else 0,  # 최대 수명
-            np.sum(pairs[:,1] - pairs[:,0])  # 총 수명
-        ]
-        
-        return features
-
-
-class TopologyCLSHead(nn.Module):
-    def __init__(self, cls_dim, feature_dim):
-        super().__init__()
-        self.mlp = nn.Sequential(
-            nn.Linear(cls_dim, cls_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(cls_dim // 2, feature_dim)
-        )
-        
-    def forward(self, cls_embeddings):
-        return self.mlp(cls_embeddings)
-
-
-#%%
-class TopologicalFeatureExtractor_:
-    def __init__(self, max_dim=1, n_bins=10):
-        self.max_dim = max_dim
-        self.n_bins = n_bins
-        
-    def extract_persistence_features(self, edge_index, num_nodes):
-        # 거리 행렬 계산
-        adj_matrix = to_dense_adj(edge_index)[0].cpu().numpy()
-        dist_matrix = self._compute_distance_matrix(adj_matrix, num_nodes)
-        
-        # Rips complex 계산
-        rips_complex = gd.RipsComplex(distance_matrix=dist_matrix)
-        simplex_tree = rips_complex.create_simplex_tree(max_dimension=self.max_dim)
-        
-        # 퍼시스턴스 다이어그램 계산
-        persistence = simplex_tree.persistence()
-        
-        features = []
-        for dim in range(self.max_dim + 1):
-            # 해당 차원의 persistence pairs 추출
-            pairs = [(birth, death) for (d, (birth, death)) in persistence 
-                    if d == dim and death != float('inf')]
-            
-            if not pairs:
-                # 해당 차원에 특성이 없는 경우
-                features.extend([0.0] * (self.n_bins + 3))
-                continue
-                
-            pairs = np.array(pairs)
-            
-            # 1. Betti numbers (각 거리값에서의 위상학적 특성 수)
-            betti_numbers = self._compute_betti_curve(pairs, self.n_bins)
-            
-            # 2. Wasserstein distance to empty diagram
-            wasserstein_dist = self._wasserstein_distance(pairs)
-            
-            # 3. Persistence entropy
-            persistence_entropy = self._persistence_entropy(pairs)
-            
-            # 4. Total persistence
-            total_persistence = np.sum(pairs[:,1] - pairs[:,0])
-            
-            features.extend(betti_numbers)
-            features.extend([wasserstein_dist, persistence_entropy, total_persistence])
-            
-        return torch.tensor(features, dtype=torch.float)
-    
-    def _compute_betti_curve(self, pairs, n_bins):
-        """각 거리값에서의 Betti number 계산"""
-        if len(pairs) == 0:
-            return [0] * n_bins
-            
-        min_birth = np.min(pairs[:,0])
-        max_death = np.max(pairs[:,1])
-        
-        # 거리값 구간 나누기
-        bins = np.linspace(min_birth, max_death, n_bins+1)
-        betti_numbers = np.zeros(n_bins)
-        
-        # 각 구간에서 살아있는 위상학적 특성 수 계산
-        for i in range(n_bins):
-            eps = bins[i]
-            count = np.sum((pairs[:,0] <= eps) & (pairs[:,1] > eps))
-            betti_numbers[i] = count
-            
-        return betti_numbers.tolist()
-    
-    def _wasserstein_distance(self, pairs, p=2):
-        """빈 다이어그램과의 Wasserstein distance 계산"""
-        # 빈 다이어그램과의 거리는 단순히 각 점의 대각선까지의 거리의 p-norm
-        distances = (pairs[:,1] - pairs[:,0]) / np.sqrt(2)
-        return np.power(np.sum(np.power(distances, p)), 1/p)
-    
-    def _persistence_entropy(self, pairs):
-        """Persistence entropy 계산"""
-        lifetimes = pairs[:,1] - pairs[:,0]
-        total_lifetime = np.sum(lifetimes)
-        
-        if total_lifetime == 0:
-            return 0
-            
-        # 각 위상학적 특성의 상대적 수명 계산
-        probabilities = lifetimes / total_lifetime
-        
-        # Entropy 계산
-        entropy = -np.sum(probabilities * np.log2(probabilities))
-        return entropy
-    
-    def _compute_distance_matrix(self, adj_matrix, num_nodes):
-        """최단 경로 거리 행렬 계산"""
-        G = nx.from_numpy_array(adj_matrix)
-        dist_matrix = np.zeros((num_nodes, num_nodes))
-        
-        for i in range(num_nodes):
-            for j in range(i+1, num_nodes):
-                try:
-                    dist = nx.shortest_path_length(G, source=i, target=j)
-                    dist_matrix[i,j] = dist_matrix[j,i] = dist
-                except nx.NetworkXNoPath:
-                    dist_matrix[i,j] = dist_matrix[j,i] = float('inf')
-                    
-        return dist_matrix
-
     
 #%%
 '''ARGPARSER'''
@@ -1026,10 +824,84 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
     return cluster_centers, clustering_metrics
 
 
+class GraphHomologyCalculator:
+    def __init__(self, max_dimension=2):
+        self.max_dimension = max_dimension
+        
+    def compute_graph_homology(self, edge_index, num_nodes):
+        """
+        주어진 그래프에 대한 호몰로지 특성을 계산합니다.
+        
+        Args:
+            edge_index: 그래프의 엣지 인덱스 (2 x E)
+            num_nodes: 그래프의 노드 수
+            
+        Returns:
+            homology_features: 호몰로지 특성 벡터
+        """
+        # NetworkX 그래프 생성
+        G = nx.Graph()
+        G.add_nodes_from(range(num_nodes))
+        edges = edge_index.t().cpu().numpy()
+        G.add_edges_from(edges)
+        
+        # 거리 행렬 계산
+        adj_matrix = nx.adjacency_matrix(G)
+        distances = shortest_path(csr_matrix(adj_matrix))
+        
+        # Vietoris-Rips complex 생성
+        rips_complex = gd.RipsComplex(distance_matrix=distances)
+        simplex_tree = rips_complex.create_simplex_tree(max_dimension=self.max_dimension)
+
+        # # persistence 계산을 먼저 수행
+        # simplex_tree.compute_persistence()  # 이 줄을 추가
+    
+        # 추가적인 위상학적 특성 계산
+        persistent_homology = simplex_tree.persistence()
+        
+        # 베티 수 계산
+        betti_numbers = simplex_tree.betti_numbers()
+        
+        # 특성 벡터 생성
+        features = []
+        
+        # 베티 수 추가
+        features.extend(betti_numbers)
+        
+        # 각 차원의 persistence diagram 통계 추가
+        for dim in range(self.max_dimension + 1):
+            dim_persistence = [p[1][1] - p[1][0] for p in persistent_homology if p[0] == dim and p[1][1] != float('inf')]
+            if dim_persistence:
+                features.extend([
+                    np.mean(dim_persistence),
+                    np.std(dim_persistence) if len(dim_persistence) > 1 else 0,
+                    np.max(dim_persistence),
+                    len(dim_persistence)  # 해당 차원의 홀 개수
+                ])
+            else:
+                features.extend([0, 0, 0, 0])
+        
+        return np.array(features, dtype=np.float32)
+
+
+class HomologyPredictor(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim, output_dim)
+        )
+        
+    def forward(self, x):
+        return self.mlp(x)
+
+
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
 class GRAPH_AUTOENCODER(nn.Module):
-    def __init__(self, num_features, hidden_dims, max_nodes, nhead_BERT, nhead, num_layers_BERT, num_layers, dropout_rate=0.1):
+    def __init__(self, num_features, hidden_dims, max_nodes, nhead_BERT, nhead, num_layers_BERT, num_layers, homology_dims, dropout_rate=0.1):
         super().__init__()
         self.encoder = BertEncoder(
             num_features=num_features,
@@ -1055,14 +927,12 @@ class GRAPH_AUTOENCODER(nn.Module):
             nn.Linear(hidden_dims[-1], hidden_dims[-1])
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
-
-        # 위상학적 특성 추출기와 CLS 헤드 추가
-        self.topo_extractor = TopologicalFeatureExtractor(max_dim=1)
-        self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], 8)  # 8 = 2차원 * 4특성
         
-        # self.topo_extractor = TopologicalFeatureExtractor_(max_dim=1, n_bins=10)
-        # topo_feature_dim = (1 + 1) * (10 + 3)  # = 26 차원
-        # self.topo_cls_head = TopologyCLSHead(hidden_dims[-1], topo_feature_dim)
+        self.homology_predictor = HomologyPredictor(
+            input_dim=hidden_dims[-1],
+            hidden_dim=hidden_dims[-1] // 2,
+            output_dim=homology_dims
+        )
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
         # BERT 인코딩
@@ -1088,9 +958,9 @@ class GRAPH_AUTOENCODER(nn.Module):
         node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
         u = torch.cat(node_outputs, dim=0)
         
-        # 위상학적 특성 예측
-        topo_pred = self.topo_cls_head(cls_output)
-        
+        # 호몰로지 예측
+        homology_pred = self.homology_predictor(cls_output)
+
         # 디코딩
         u_prime = self.u_mlp(u)
         x_recon = self.feature_decoder(u_prime)
@@ -1100,7 +970,7 @@ class GRAPH_AUTOENCODER(nn.Module):
                 return cls_output, x_recon, adj_recon_list
             else:
                 return cls_output, x_recon, masked_outputs
-        return cls_output, x_recon, topo_pred
+        return cls_output, x_recon, homology_pred
     
 
 #%%
@@ -1121,6 +991,9 @@ print(f'Number of graphs: {num_train}')
 print(f'Number of features: {num_features}')
 print(f'Number of edge features: {num_edge_features}')
 print(f'Max nodes: {max_nodes}')
+
+max_dimension = 2  # 0, 1, 2차원의 호몰로지
+homology_dim = (max_dimension + 1) + (max_dimension + 1) * 4  # = 15
 
 current_time_ = time.localtime()
 current_time = time.strftime("%Y_%m_%d_%H_%M", current_time_)
@@ -1153,6 +1026,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         nhead=n_head,
         num_layers_BERT=n_layer_BERT,
         num_layers=n_layer,
+        homology_dims=homology_dim,
         dropout_rate=dropout_rate
     ).to(device)
     
@@ -1206,8 +1080,8 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
             print(f"\nClustering Analysis Results (Epoch {epoch}):")
             print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
             
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model_with_density(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, epoch, trial, train_errors, device)
-
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model_with_density(model, test_loader, cluster_centers, train_errors, device)
+                                                                                                                                                                    
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
             os.makedirs(os.path.dirname(save_path_), exist_ok=True)
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/'
