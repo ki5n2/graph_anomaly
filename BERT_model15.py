@@ -1,6 +1,6 @@
 #%%
 '''PRESENT'''
-print('이번 BERT 모델 14은 AIDS, BZR, COX2, DHFR에 대한 실험 파일입니다. 마스크 토큰 재구성을 통한 프리-트레인이 이루어집니다. 이후 기존과 같이 노드 특성을 재구성하는 모델을 통해 이상을 탐지합니다. 기존 파일과 다른 점은 성능 평가 결과 비교를 코드 내에서 수행하고자 하였으며, 해당 파일만 실행하면 결과까지 한 번에 볼 수 있도록 하였습니다. 또한, 재구성 오류에 대한 정규화가 이루어져 있습니다. 추가로 훈련 데이터에 대한 산점도와 로그 스케일이 적용되어 있습니다. 그리고 2D density estimation이 적용되어 있습니다. 그리고 지속적 호몰로지가 반영되어 있습니다.')
+print('이번 BERT 모델 15은 AIDS, BZR, COX2, DHFR에 대한 실험 파일입니다. 마스크 토큰 재구성을 통한 프리-트레인이 이루어집니다. 이후 기존과 같이 노드 특성을 재구성하는 모델을 통해 이상을 탐지합니다. 기존 파일과 다른 점은 성능 평가 결과 비교를 코드 내에서 수행하고자 하였으며, 해당 파일만 실행하면 결과까지 한 번에 볼 수 있도록 하였습니다. 또한, 재구성 오류에 대한 정규화가 이루어져 있습니다. 추가로 훈련 데이터에 대한 산점도와 로그 스케일이 적용되어 있습니다. 그리고 2D density estimation이 적용되어 있습니다. 그리고 호몰로지가 반영되어 있습니다.')
 
 #%%
 '''IMPORTS'''
@@ -29,6 +29,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.datasets import TUDataset
+from torch_geometric.utils import subgraph, to_networkx
 from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, OneCycleLR
 from torch_geometric.utils import to_networkx, get_laplacian, to_dense_adj, to_dense_batch
 from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, global_add_pool
@@ -102,7 +103,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
         data = data.to(device)
         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
         
-        train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
+        train_cls_outputs, x_recon, homology_preds = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
             cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
@@ -134,30 +135,13 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             
             start_node = end_node
 
-        # # CLS Similarity Loss
-        # if num_graphs > 1:  # 배치에 2개 이상의 그래프가 있을 때만 계산
-        #     # 1. Pairwise Distance Matrix 계산
-        #     cls_distances = torch.cdist(train_cls_outputs, train_cls_outputs, p=2)  # [num_graphs, num_graphs]
-            
-        #     # 2. 대각선 요소 제외 (자기 자신과의 거리)
-        #     mask = ~torch.eye(num_graphs, dtype=bool, device=device)
-        #     cls_distances = cls_distances[mask]
-            
-        #     # 3. 평균 거리 계산
-        #     cls_loss = cls_distances.mean()
-        # else:
-        #     cls_loss = torch.tensor(0.0, device=device)
-        center = torch.mean(train_cls_outputs, dim=0)  # 현재 배치의 CLS 출력 평균
-        cls_loss = torch.mean(torch.norm(train_cls_outputs - center, dim=1))  # 평균으로부터의 거리
-        
-        # Total Loss (alpha는 CLS 손실의 가중치)
-        alpha_ = 10.0  # 이 값은 조정 가능
-        cls_loss = alpha_ * cls_loss
-        
-        loss = node_loss + cls_loss
+        homology_labels = calculate_homology_features(x, edge_index, batch).to(device)
+        homology_loss = F.mse_loss(homology_preds, homology_labels)
+
+        loss = node_loss + homology_loss
         
         print(f'node_loss: {node_loss}')
-        print(f'cls_loss: {cls_loss}')
+        print(f'homology_loss: {homology_loss}')
         
         num_sample += num_graphs
         loss.backward()
@@ -209,7 +193,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            e_cls_output, x_recon, homology_preds = model(x, edge_index, batch, num_graphs)
             
             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()
             
@@ -650,6 +634,56 @@ def plot_density_results(train_data, test_normal, test_anomaly, epoch, trial, ba
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
     plt.close()
             
+            
+def calculate_homology_features(x, edge_index, batch):
+    """
+    그래프에서 호몰로지 정보를 계산합니다.
+    :param x: 노드 특징 행렬 (N x F)
+    :param edge_index: 엣지 인덱스 (2 x E)
+    :param batch: 각 노드가 속한 그래프의 배치 인덱스 (N)
+    :return: 각 그래프의 호몰로지 정보 (Tensor)
+    """
+    features = []
+    unique_batches = batch.unique()
+    num_nodes = batch.size(0)
+    for graph_id in batch.unique():
+        # 그래프 추출
+        mask = batch == graph_id
+        node_indices = mask.nonzero(as_tuple=True)[0]
+        sub_edge_index, _ = subgraph(node_indices, edge_index, relabel_nodes=True)
+        
+        # NetworkX 그래프로 변환
+        nx_graph = nx.Graph()
+        nx_graph.add_nodes_from(range(len(node_indices)))
+        nx_graph.add_edges_from(sub_edge_index.t().tolist())
+        
+        # H₀: 연결 성분 개수
+        H0 = nx.number_connected_components(nx_graph)
+        
+        # H₁: 사이클 개수
+        H1 = nx.number_of_edges(nx_graph) - nx.number_of_nodes(nx_graph) + H0
+        
+        # 고리 크기 분포
+        cycles = nx.cycle_basis(nx_graph)
+        cycle_sizes = [len(cycle) for cycle in cycles]
+        if len(cycle_sizes) > 0:
+            avg_cycle_size = sum(cycle_sizes) / len(cycle_sizes)
+            max_cycle_size = max(cycle_sizes)
+            min_cycle_size = min(cycle_sizes)
+        else:
+            avg_cycle_size = 0.0
+            max_cycle_size = 0.0
+            min_cycle_size = 0.0
+        
+        # 방향족 고리 비율
+        aromaticity = [len(cycle) == 6 for cycle in cycles]
+        aromatic_ratio = sum(aromaticity) / len(aromaticity) if len(aromaticity) > 0 else 0.0
+        
+        # 고정된 크기의 벡터로 변환
+        features.append([H0, H1, avg_cycle_size, max_cycle_size, min_cycle_size, aromatic_ratio])
+    
+    return torch.tensor(features, dtype=torch.float32)
+
     
 #%%
 '''ARGPARSER'''
@@ -1195,6 +1229,11 @@ class GRAPH_AUTOENCODER(nn.Module):
             nn.Linear(hidden_dims[-1], hidden_dims[-1])
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
+        self.homology_predictor = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1] // 2, 6)  # H0, H1, cycle_size 평균, 방향족 비율
+        )
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
         # BERT 인코딩
@@ -1219,7 +1258,10 @@ class GRAPH_AUTOENCODER(nn.Module):
         cls_output = encoded[:, 0, :]
         node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
         u = torch.cat(node_outputs, dim=0)
-            
+        
+        # CLS로 호몰로지 예측
+        homology_preds = self.homology_predictor(cls_output)
+        
         # 디코딩
         u_prime = self.u_mlp(u)
         x_recon = self.feature_decoder(u_prime)
@@ -1229,7 +1271,7 @@ class GRAPH_AUTOENCODER(nn.Module):
                 return cls_output, x_recon, adj_recon_list
             else:
                 return cls_output, x_recon, masked_outputs
-        return cls_output, x_recon
+        return cls_output, x_recon, homology_preds
     
 
 #%%
