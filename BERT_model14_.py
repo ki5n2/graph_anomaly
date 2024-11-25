@@ -97,7 +97,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
     num_sample = 0
     reconstruction_errors = []
     
-    homology_calculator = GraphHomologyCalculator(max_dimension=2)
+    homology_calculator = GraphHomologyCalculator(max_dimension=1)
 
     for data in train_loader:
         recon_optimizer.zero_grad()
@@ -166,7 +166,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
 
 
 #%%
-def evaluate_model_with_density(model, test_loader, cluster_centers, reconstruction_errors, device):
+def evaluation(model, test_loader, cluster_centers, reconstruction_errors, device):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
@@ -178,7 +178,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, reconstruct
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            e_cls_output, x_recon, homology_pred = model(x, edge_index, batch, num_graphs)
             
             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()
             
@@ -815,12 +815,6 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
     cluster_centers, clustering_metrics = analyzer.perform_clustering_with_analysis(
         train_cls_outputs, epoch)
     
-    # wandb에 메트릭 기록
-    wandb.log({
-        'cluster_sizes': clustering_metrics['cluster_sizes'],
-        'epoch': epoch
-    })
-    
     return cluster_centers, clustering_metrics
 
 
@@ -853,11 +847,8 @@ class GraphHomologyCalculator:
         rips_complex = gd.RipsComplex(distance_matrix=distances)
         simplex_tree = rips_complex.create_simplex_tree(max_dimension=self.max_dimension)
 
-        # # persistence 계산을 먼저 수행
-        # simplex_tree.compute_persistence()  # 이 줄을 추가
-    
-        # 추가적인 위상학적 특성 계산
-        persistent_homology = simplex_tree.persistence()
+        # persistence 계산
+        simplex_tree.compute_persistence()
         
         # 베티 수 계산
         betti_numbers = simplex_tree.betti_numbers()
@@ -865,23 +856,34 @@ class GraphHomologyCalculator:
         # 특성 벡터 생성
         features = []
         
-        # 베티 수 추가
-        features.extend(betti_numbers)
+        # 베티 수 추가 (고정된 길이로 패딩)
+        if len(betti_numbers) < self.max_dimension + 1:
+            # 부족한 만큼 0으로 채움
+            betti_numbers = list(betti_numbers) + [0] * (self.max_dimension + 1 - len(betti_numbers))
+        features.extend(betti_numbers[:self.max_dimension + 1])  # 최대 차원까지만 사용
         
-        # 각 차원의 persistence diagram 통계 추가
+        # persistence diagram 통계
+        persistence = simplex_tree.persistence()
         for dim in range(self.max_dimension + 1):
-            dim_persistence = [p[1][1] - p[1][0] for p in persistent_homology if p[0] == dim and p[1][1] != float('inf')]
+            dim_persistence = [p[1][1] - p[1][0] for p in persistence if p[0] == dim and p[1][1] != float('inf')]
             if dim_persistence:
                 features.extend([
-                    np.mean(dim_persistence),
-                    np.std(dim_persistence) if len(dim_persistence) > 1 else 0,
-                    np.max(dim_persistence),
-                    len(dim_persistence)  # 해당 차원의 홀 개수
+                    float(np.mean(dim_persistence)),
+                    float(np.std(dim_persistence)) if len(dim_persistence) > 1 else 0.0,
+                    float(np.max(dim_persistence)),
+                    float(len(dim_persistence))
                 ])
             else:
-                features.extend([0, 0, 0, 0])
+                # 해당 차원의 persistence가 없는 경우 0으로 채움
+                features.extend([0.0, 0.0, 0.0, 0.0])
+                
+        # numpy 배열로 변환하고 타입 확인
+        features = np.array(features, dtype=np.float32)
         
-        return np.array(features, dtype=np.float32)
+        # NaN이나 inf 값을 0으로 대체
+        features = np.nan_to_num(features, 0.0)
+        
+        return features
 
 
 class HomologyPredictor(nn.Module):
@@ -992,7 +994,7 @@ print(f'Number of features: {num_features}')
 print(f'Number of edge features: {num_edge_features}')
 print(f'Max nodes: {max_nodes}')
 
-max_dimension = 2  # 0, 1, 2차원의 호몰로지
+max_dimension = 1  # 0, 1, 2차원의 호몰로지
 homology_dim = (max_dimension + 1) + (max_dimension + 1) * 4  # = 15
 
 current_time_ = time.localtime()
@@ -1080,7 +1082,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
             print(f"\nClustering Analysis Results (Epoch {epoch}):")
             print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
             
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model_with_density(model, test_loader, cluster_centers, train_errors, device)
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluation(model, test_loader, cluster_centers, train_errors, device)
                                                                                                                                                                     
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
             os.makedirs(os.path.dirname(save_path_), exist_ok=True)

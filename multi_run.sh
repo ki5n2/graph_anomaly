@@ -29,7 +29,7 @@ RUN_SRC=./run_src.sh
 ENV=/home1/rldnjs16/ENTER/envs/graph/bin/python3
 
 # file directory of experiment ".py"
-EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model14_.py
+EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model14__.py
 
 for index in ${!experiments[*]}; do
     sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[1]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 

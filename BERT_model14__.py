@@ -102,7 +102,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
         data = data.to(device)
         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
         
-        train_cls_outputs, x_recon, structure_pred = model(x, edge_index, batch, num_graphs)
+        train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
             cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
@@ -134,12 +134,28 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             
             start_node = end_node
 
-        graph_properties = compute_graph_properties(data, batch)
-        structure_loss = F.mse_loss(structure_pred, graph_properties)
-        loss = node_loss + structure_loss
+        # CLS Similarity Loss
+        if num_graphs > 1:  # 배치에 2개 이상의 그래프가 있을 때만 계산
+            # 1. Pairwise Distance Matrix 계산
+            cls_distances = torch.cdist(train_cls_outputs, train_cls_outputs, p=2)  # [num_graphs, num_graphs]
+            
+            # 2. 대각선 요소 제외 (자기 자신과의 거리)
+            mask = ~torch.eye(num_graphs, dtype=bool, device=device)
+            cls_distances = cls_distances[mask]
+            
+            # 3. 평균 거리 계산
+            cls_loss = cls_distances.mean()
+        else:
+            cls_loss = torch.tensor(0.0, device=device)
+        
+        # Total Loss (alpha는 CLS 손실의 가중치)
+        alpha_ = 10.0  # 이 값은 조정 가능
+        cls_loss = alpha_ * cls_loss
+        
+        loss = node_loss + cls_loss
         
         print(f'node_loss: {node_loss}')
-        print(f'structure_loss: {structure_loss}')
+        print(f'cls_loss: {cls_loss}')
         
         num_sample += num_graphs
         loss.backward()
@@ -191,7 +207,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
         for data in test_loader:
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon, structure_pred = model(x, edge_index, batch, num_graphs)
+            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
             
             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()
             
@@ -1148,50 +1164,6 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
     return cluster_centers, clustering_metrics
 
             
-class GraphStructurePredictor(nn.Module):
-    def __init__(self, hidden_dim):
-        super().__init__()
-        self.predictor = nn.Sequential(
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.ReLU(),
-            nn.Linear(hidden_dim // 2, 4)  # 4가지 구조적 특성 예측
-        )
-    
-    def forward(self, cls_embedding):
-        return self.predictor(cls_embedding)
-
-
-def compute_graph_properties(data, batch):
-    properties = []
-    for i in range(batch.max() + 1):
-        mask = (batch == i)
-        sub_edge_index = data.edge_index[:, mask[data.edge_index[0]] & mask[data.edge_index[1]]]
-        num_nodes = mask.sum().item()
-        num_edges = sub_edge_index.size(1)
-        
-        # 1. Average degree
-        avg_degree = (2 * num_edges) / num_nodes
-        
-        # 2. Graph density
-        density = (2 * num_edges) / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0
-        
-        # 3. Clustering coefficient approximation
-        adj = to_dense_adj(sub_edge_index)[0]
-        tri = torch.matmul(torch.matmul(adj, adj), adj).trace() / 6
-        possible_tri = torch.sum(torch.combinations(torch.arange(num_nodes), r=3))
-        clustering_coef = tri / possible_tri if possible_tri > 0 else 0
-        
-        # 4. Diameter approximation (using max of shortest paths between sample node pairs)
-        G = to_networkx(Data(edge_index=sub_edge_index, num_nodes=num_nodes))
-        sample_nodes = random.sample(range(num_nodes), min(5, num_nodes))
-        paths = [nx.shortest_path_length(G, source=i) for i in sample_nodes]
-        diameter = max([max(p.values()) for p in paths]) if paths else 0
-        
-        properties.append([avg_degree, density, clustering_coef, diameter])
-    
-    return torch.tensor(properties, device=data.edge_index.device)
-
-
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
 class GRAPH_AUTOENCODER(nn.Module):
@@ -1221,7 +1193,6 @@ class GRAPH_AUTOENCODER(nn.Module):
             nn.Linear(hidden_dims[-1], hidden_dims[-1])
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
-        self.structure_predictor = GraphStructurePredictor(hidden_dims[-1])
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
         # BERT 인코딩
@@ -1246,9 +1217,7 @@ class GRAPH_AUTOENCODER(nn.Module):
         cls_output = encoded[:, 0, :]
         node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
         u = torch.cat(node_outputs, dim=0)
-        
-        structure_pred = self.structure_predictor(cls_output)
-    
+            
         # 디코딩
         u_prime = self.u_mlp(u)
         x_recon = self.feature_decoder(u_prime)
@@ -1258,7 +1227,7 @@ class GRAPH_AUTOENCODER(nn.Module):
                 return cls_output, x_recon, adj_recon_list
             else:
                 return cls_output, x_recon, masked_outputs
-        return cls_output, x_recon, structure_pred
+        return cls_output, x_recon
     
 
 #%%
