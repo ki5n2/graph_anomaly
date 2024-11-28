@@ -15,6 +15,7 @@ import torch
 import random
 import argparse
 import numpy as np
+import gudhi as gd
 import seaborn as sns
 import torch.nn as nn
 import torch.optim as optim
@@ -28,6 +29,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch_geometric.data import Data, Batch
 from torch_geometric.loader import DataLoader
 from torch_geometric.datasets import TUDataset
+from torch_geometric.utils import subgraph, to_networkx
 from torch.optim.lr_scheduler import CosineAnnealingLR, ExponentialLR, OneCycleLR
 from torch_geometric.utils import to_networkx, get_laplacian, to_dense_adj, to_dense_batch
 from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, global_add_pool
@@ -40,12 +42,16 @@ from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_sc
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from sklearn.metrics.pairwise import rbf_kernel, cosine_similarity
 from sklearn.cluster import SpectralClustering
-from sklearn.neighbors import kneighbors_graph
+from sklearn.neighbors import kneighbors_graph, KernelDensity
 from sklearn.manifold import SpectralEmbedding
+from sklearn.preprocessing import StandardScaler
 
 from functools import partial
-from scipy.linalg import eigh
 from multiprocessing import Pool
+
+from scipy.linalg import eigh
+from scipy.sparse import csr_matrix
+from scipy.sparse.csgraph import shortest_path
 
 from modules.loss import loss_cal
 from modules.utils import set_seed, set_device, EarlyStopping, get_ad_split_TU, get_data_loaders_TU, adj_original
@@ -63,7 +69,7 @@ def train_bert_embedding(model, train_loader, bert_optimizer, device):
     for data in train_loader:
         bert_optimizer.zero_grad()
         data = data.to(device)
-        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        x, edge_index, batch, num_graphs, node_label = data.x, data.edge_index, data.batch, data.num_graphs, data.node_label
         
         # 마스크 생성
         mask_indices = torch.rand(x.size(0), device=device) < 0.15  # 15% 노드 마스킹
@@ -95,27 +101,25 @@ def train(model, train_loader, recon_optimizer, max_nodes, device, epoch):
     for data in train_loader:
         recon_optimizer.zero_grad()
         data = data.to(device)
-        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        x, edge_index, batch, num_graphs, node_label = data.x, data.edge_index, data.batch, data.num_graphs, data.node_label
         
-        train_cls_outputs, x_recon = model(x, edge_index, batch, num_graphs)
+        train_cls_outputs, x_recon, atom_number_pred = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
-            # cluster_centers = train_cls_outputs.mean(dim=0)
-            # cluster_centers = cluster_centers.detach().cpu().numpy()
-            # cluster_centers = cluster_centers.reshape(-1, hidden_dims[-1])
             cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
             kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
             kmeans.fit(cls_outputs_np)
             cluster_centers = kmeans.cluster_centers_
             
         loss = 0
+        node_loss = 0
         start_node = 0
         for i in range(num_graphs):
             num_nodes = (batch == i).sum().item()
             end_node = start_node + num_nodes
 
-            node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-            loss += node_loss
+            node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+            node_loss += node_loss_
             
             if epoch % 5 == 0:
                 node_loss_scaled = node_loss.item() * alpha
@@ -130,6 +134,30 @@ def train(model, train_loader, recon_optimizer, max_nodes, device, epoch):
                 })
             
             start_node = end_node
+        
+        # graph_properties = compute_graph_properties(data, batch)
+        # structure_loss = F.mse_loss(homology_preds, graph_properties)
+        
+        # 각 그래프별 원자 번호 합 계산
+        atom_sums = []
+        start_idx = 0
+        for i in range(num_graphs):
+            num_nodes = (batch == i).sum().item()
+            graph_labels = node_label[start_idx:start_idx + num_nodes]
+            atom_sum = graph_labels.sum().item()
+            atom_sums.append(atom_sum)
+            start_idx += num_nodes
+        atom_sums = torch.tensor(atom_sums, device=device).float().unsqueeze(1)  # [batch_size, 1]
+        
+        # CLS 토큰의 원자 번호 합 예측 손실
+        cls_loss = F.mse_loss(atom_number_pred, atom_sums)
+        alpha_ = 10
+        cls_loss = alpha_ * cls_loss
+
+        loss = node_loss + cls_loss
+        
+        print(f'node_loss: {node_loss}')
+        print(f'cls_loss: {cls_loss}')
         
         num_sample += num_graphs
         loss.backward()
@@ -180,22 +208,13 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
-            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon = model(x, edge_index, batch, num_graphs)
+            x, edge_index, batch, num_graphs, node_label = data.x, data.edge_index, data.batch, data.num_graphs, data.node_label
+            e_cls_output, x_recon, atom_number_pred = model(x, edge_index, batch, num_graphs)
             
             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
-            # spectral_embedder_test = SpectralEmbedding(
-            #     n_components=n_clusters, 
-            #     affinity='rbf', 
-            #     gamma=gamma_clusters,
-            #     random_state=random_seed
-            # )
-
-            # spectral_embeddings_test = spectral_embedder_test.fit_transform(e_cls_outputs_np)  # [num_graphs, k]
             
             recon_errors = []
             start_node = 0
-            
             for i in range(num_graphs):
                 num_nodes = (batch == i).sum().item()
                 end_node = start_node + num_nodes
@@ -272,126 +291,6 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
 
 
 #%%
-def analyze_cls_embeddings(model, test_loader, epoch, device, n_components=2):
-    """
-    CLS token embeddings를 추출하고 PCA를 적용하여 더 자세한 분석 수행
-    
-    Args:
-        model: 학습된 모델
-        test_loader: 테스트 데이터 로더
-        device: 연산 장치
-        n_components: PCA 차원 수
-    """
-    model.eval()
-    cls_embeddings = []
-    labels = []
-    
-    # CLS embeddings 추출
-    with torch.no_grad():
-        for data in test_loader:
-            data = data.to(device)
-            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            
-            cls_output, _ = model(x, edge_index, batch, num_graphs)
-            cls_embeddings.append(cls_output.cpu())
-            labels.extend(data.y.cpu().numpy())
-    
-    # 텐서를 numpy 배열로 변환
-    cls_embeddings = torch.cat(cls_embeddings, dim=0).numpy()
-    labels = np.array(labels)
-    
-    # PCA 적용
-    pca = PCA()
-    cls_embeddings_pca = pca.fit_transform(cls_embeddings)
-    
-    # 분산 설명률 계산
-    explained_variance_ratio = pca.explained_variance_ratio_
-    cumulative_variance_ratio = np.cumsum(explained_variance_ratio)
-    eigenvalues = pca.explained_variance_
-    
-    # 시각화
-    plt.figure(figsize=(20, 15))
-    
-    # 1. PCA 산점도 (첫 2개 주성분)
-    plt.subplot(221)
-    scatter = plt.scatter(cls_embeddings_pca[:, 0], cls_embeddings_pca[:, 1], 
-                         c=labels, cmap='coolwarm', alpha=0.6)
-    plt.colorbar(scatter, label='Label (0: Normal, 1: Anomaly)')
-    plt.xlabel(f'PC1 (variance ratio: {explained_variance_ratio[0]:.3f})')
-    plt.ylabel(f'PC2 (variance ratio: {explained_variance_ratio[1]:.3f})')
-    plt.title('PCA of CLS Token Embeddings')
-    
-    # 2. 누적 분산 설명률
-    plt.subplot(222)
-    plt.plot(range(1, len(cumulative_variance_ratio) + 1), 
-             cumulative_variance_ratio, 'bo-')
-    plt.axhline(y=0.95, color='r', linestyle='--', label='95% threshold')
-    plt.xlabel('Number of Components')
-    plt.ylabel('Cumulative Explained Variance Ratio')
-    plt.title('Cumulative Explained Variance Ratio')
-    plt.grid(True)
-    plt.legend()
-    
-    # 3. 스크린 플롯
-    plt.subplot(223)
-    plt.plot(range(1, len(eigenvalues) + 1), eigenvalues, 'bo-')
-    plt.xlabel('Principal Component')
-    plt.ylabel('Eigenvalue')
-    plt.title('Scree Plot')
-    plt.grid(True)
-    
-    # 4. 로그 스케일 스크린 플롯
-    plt.subplot(224)
-    plt.plot(range(1, len(eigenvalues) + 1), eigenvalues, 'bo-')
-    plt.yscale('log')
-    plt.xlabel('Principal Component')
-    plt.ylabel('Eigenvalue (log scale)')
-    plt.title('Scree Plot (Log Scale)')
-    plt.grid(True)
-    
-    plt.tight_layout()
-    
-    # 분석 결과 저장
-    save_path = f'/home1/rldnjs16/graph_anomaly_detection/pca_analysis/cls_pca_analysis_{dataset_name}_fold_{trial}_ep_{epoch}_{current_time}.png'
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path)
-    plt.close()
-    
-    # 주요 지표 계산
-    n_components_90 = np.argmax(cumulative_variance_ratio >= 0.9) + 1
-    n_components_95 = np.argmax(cumulative_variance_ratio >= 0.95) + 1
-    
-    # 분석 결과 출력
-    print("\nPCA Analysis Results:")
-    print(f"Number of features in original space: {cls_embeddings.shape[1]}")
-    print(f"Number of components needed for 90% variance: {n_components_90}")
-    print(f"Number of components needed for 95% variance: {n_components_95}")
-    print("\nTop 5 Principal Components:")
-    for i in range(5):
-        print(f"PC{i+1}: {explained_variance_ratio[i]:.4f} "
-              f"(cumulative: {cumulative_variance_ratio[i]:.4f})")
-    
-    # Class separation analysis
-    normal_indices = labels == 0
-    anomaly_indices = labels == 1
-    
-    pc1_normal = cls_embeddings_pca[normal_indices, 0]
-    pc1_anomaly = cls_embeddings_pca[anomaly_indices, 0]
-    pc2_normal = cls_embeddings_pca[normal_indices, 1]
-    pc2_anomaly = cls_embeddings_pca[anomaly_indices, 1]
-    
-    print("\nClass Separation Analysis:")
-    print("PC1 - Normal vs Anomaly:")
-    print(f"Normal mean: {np.mean(pc1_normal):.4f}, std: {np.std(pc1_normal):.4f}")
-    print(f"Anomaly mean: {np.mean(pc1_anomaly):.4f}, std: {np.std(pc1_anomaly):.4f}")
-    print("\nPC2 - Normal vs Anomaly:")
-    print(f"Normal mean: {np.mean(pc2_normal):.4f}, std: {np.std(pc2_normal):.4f}")
-    print(f"Anomaly mean: {np.mean(pc2_anomaly):.4f}, std: {np.std(pc2_anomaly):.4f}")
-    
-    return cls_embeddings_pca, explained_variance_ratio, eigenvalues
-
-
-#%%
 def plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time):
     # 데이터 분리
     train_normal_recon = [e['reconstruction'] for e in train_errors if e['type'] == 'train_normal']
@@ -450,6 +349,109 @@ def plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_nam
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     with open(json_path, 'w') as f:
         json.dump(error_data, f)
+
+
+def calculate_homology_features(x, edge_index, batch):
+    """
+    그래프에서 호몰로지 정보를 계산합니다.
+    :param x: 노드 특징 행렬 (N x F)
+    :param edge_index: 엣지 인덱스 (2 x E)
+    :param batch: 각 노드가 속한 그래프의 배치 인덱스 (N)
+    :return: 각 그래프의 호몰로지 정보 (Tensor)
+    """
+    features = []
+    unique_batches = batch.unique()
+    num_nodes = batch.size(0)
+    for graph_id in unique_batches:
+        # 그래프 추출
+        mask = batch == graph_id
+        node_indices = mask.nonzero().squeeze(1)  # Changed this line
+        # node_indices = mask.nonzero(as_tuple=True)[0]
+        
+        # 에러 방지를 위한 디바이스 확인 및 CPU로 이동
+        node_indices = node_indices.cpu()
+        edge_index_cpu = edge_index.cpu()
+        
+        # subgraph 함수 호출 수정
+        sub_edge_index, edge_attr = subgraph(
+            node_indices, 
+            edge_index_cpu,
+            relabel_nodes=True,
+            num_nodes=num_nodes
+        )
+                
+        # NetworkX 그래프로 변환
+        nx_graph = nx.Graph()
+        nx_graph.add_nodes_from(range(len(node_indices)))
+        edge_list = sub_edge_index.t().tolist()
+        nx_graph.add_edges_from(edge_list)
+        
+        # H₀: 연결 성분 개수
+        H0 = nx.number_connected_components(nx_graph)
+        
+        # H₁: 사이클 개수
+        H1 = nx.number_of_edges(nx_graph) - nx.number_of_nodes(nx_graph) + H0
+        
+        # 고리 크기 분포
+        try:
+            cycles = nx.cycle_basis(nx_graph)
+            cycle_sizes = [len(cycle) for cycle in cycles]
+            
+            if len(cycle_sizes) > 0:
+                avg_cycle_size = sum(cycle_sizes) / len(cycle_sizes)
+                max_cycle_size = max(cycle_sizes)
+                min_cycle_size = min(cycle_sizes)
+            else:
+                avg_cycle_size = 0.0
+                max_cycle_size = 0.0
+                min_cycle_size = 0.0
+                
+            # 방향족 고리 비율
+            aromaticity = [len(cycle) == 6 for cycle in cycles]
+            aromatic_ratio = sum(aromaticity) / len(aromaticity) if len(aromaticity) > 0 else 0.0
+            
+        except nx.NetworkXNoCycle:
+            avg_cycle_size = 0.0
+            max_cycle_size = 0.0
+            min_cycle_size = 0.0
+            aromatic_ratio = 0.0
+        
+        # 고정된 크기의 벡터로 변환
+        features.append([H0, H1, avg_cycle_size, max_cycle_size, min_cycle_size, aromatic_ratio])
+    
+    # 결과를 텐서로 변환하여 원래 디바이스로 반환
+    return torch.tensor(features, dtype=torch.float32).to(batch.device)
+
+
+def compute_graph_properties(data, batch):
+    properties = []
+    for i in range(batch.max() + 1):
+        mask = (batch == i)
+        sub_edge_index = data.edge_index[:, mask[data.edge_index[0]] & mask[data.edge_index[1]]]
+        num_nodes = mask.sum().item()
+        num_edges = sub_edge_index.size(1)
+        
+        # 1. Average degree
+        avg_degree = (2 * num_edges) / num_nodes
+        
+        # 2. Graph density
+        density = (2 * num_edges) / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0
+        
+        # 3. Clustering coefficient approximation
+        adj = to_dense_adj(sub_edge_index)[0]
+        tri = torch.matmul(torch.matmul(adj, adj), adj).trace() / 6
+        possible_tri = torch.sum(torch.combinations(torch.arange(num_nodes), r=3))
+        clustering_coef = tri / possible_tri if possible_tri > 0 else 0
+        
+        # 4. Diameter approximation (using max of shortest paths between sample node pairs)
+        G = to_networkx(Data(edge_index=sub_edge_index, num_nodes=num_nodes))
+        sample_nodes = random.sample(range(num_nodes), min(5, num_nodes))
+        paths = [nx.shortest_path_length(G, source=i) for i in sample_nodes]
+        diameter = max([max(p.values()) for p in paths]) if paths else 0
+        
+        properties.append([avg_degree, density, clustering_coef, diameter])
+    
+    return torch.tensor(properties, device=data.edge_index.device)
 
 
 #%%
@@ -947,10 +949,6 @@ class ClusteringAnalyzer:
             sil_score = 0
             sample_silhouette_values = np.zeros(len(cluster_labels))
         
-        # 시각화
-        self._plot_silhouette_analysis(cls_outputs_np, cluster_labels, 
-                                     sample_silhouette_values, sil_score, epoch)
-        
         cluster_centers = kmeans.cluster_centers_
         
         clustering_metrics = {
@@ -961,76 +959,12 @@ class ClusteringAnalyzer:
         }
         
         return cluster_centers, clustering_metrics
-    
-    def _plot_silhouette_analysis(self, X, cluster_labels, sample_silhouette_values, 
-                                 silhouette_avg, epoch):
-        """
-        실루엣 분석 결과 시각화
-        """
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 5))
-        
-        # 첫 번째 그래프: 실루엣 플롯
-        y_lower = 10
-        for i in range(self.n_clusters):
-            ith_cluster_silhouette_values = sample_silhouette_values[cluster_labels == i]
-            ith_cluster_silhouette_values.sort()
-            
-            size_cluster_i = ith_cluster_silhouette_values.shape[0]
-            y_upper = y_lower + size_cluster_i
-            
-            color = plt.cm.nipy_spectral(float(i) / self.n_clusters)
-            ax1.fill_betweenx(np.arange(y_lower, y_upper),
-                            0, ith_cluster_silhouette_values,
-                            facecolor=color, alpha=0.7)
-            
-            ax1.text(-0.05, y_lower + 0.5 * size_cluster_i, f'Cluster {i}')
-            y_lower = y_upper + 10
-            
-        ax1.set_title("Silhouette plot for the clusters")
-        ax1.set_xlabel("Silhouette coefficient values")
-        ax1.set_ylabel("Cluster label")
-        ax1.axvline(x=silhouette_avg, color="red", linestyle="--",
-                   label=f'Average silhouette score: {silhouette_avg:.3f}')
-        ax1.set_yticks([])
-        ax1.set_xlim([-1, 1])
-        ax1.legend()
-        
-        # 두 번째 그래프: 클러스터 산점도 (PCA 적용)
-        pca = PCA(n_components=2)
-        X_pca = pca.fit_transform(X)
-        
-        colors = plt.cm.nipy_spectral(cluster_labels.astype(float) / self.n_clusters)
-        ax2.scatter(X_pca[:, 0], X_pca[:, 1], marker='.', s=100, lw=0, alpha=0.7,
-                   c=colors, edgecolor='k')
-        
-        # Add labels and title
-        ax2.set_title("Visualization of the clustered data (PCA)")
-        ax2.set_xlabel("First Principal Component")
-        ax2.set_ylabel("Second Principal Component")
-        
-        plt.suptitle(f"Silhouette Analysis for K-means Clustering\n"
-                    f"n_clusters = {self.n_clusters}, "
-                    f"Silhouette Score: {silhouette_avg:.3f}",
-                    fontsize=14, fontweight='bold')
-        
-        # 저장 경로 설정 및 저장
-        save_path = f'/home1/rldnjs16/graph_anomaly_detection/silhouette_analysis/silhouette_analysis_epoch_{epoch}.png'
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path)
-        plt.close()
 
 
 def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
     analyzer = ClusteringAnalyzer(n_clusters, random_seed)
     cluster_centers, clustering_metrics = analyzer.perform_clustering_with_analysis(
         train_cls_outputs, epoch)
-    
-    # wandb에 메트릭 기록
-    wandb.log({
-        'silhouette_score': clustering_metrics['silhouette_score'],
-        'cluster_sizes': clustering_metrics['cluster_sizes'],
-        'epoch': epoch
-    })
     
     return cluster_centers, clustering_metrics
 
@@ -1065,6 +999,19 @@ class GRAPH_AUTOENCODER(nn.Module):
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
 
+        self.homology_predictor = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1] // 2, 4)  # H0, H1, cycle_size 평균, 방향족 비율
+        )
+        
+        # 원자 번호 합을 예측하기 위한 새로운 MLP 추가
+        self.atom_number_predictor = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1] // 2, 1)  # 단일 값 (원자 번호 합) 예측
+        )
+        
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
         # BERT 인코딩
         if training:
@@ -1089,6 +1036,12 @@ class GRAPH_AUTOENCODER(nn.Module):
         node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
         u = torch.cat(node_outputs, dim=0)
         
+        # # CLS로 호몰로지 예측
+        # homology_preds = self.homology_predictor(cls_output)
+        
+        # 원자 번호 합 예측
+        atom_number_pred = self.atom_number_predictor(cls_output)  # [batch_size, 1]
+        
         # 디코딩
         u_prime = self.u_mlp(u)
         x_recon = self.feature_decoder(u_prime)
@@ -1098,7 +1051,7 @@ class GRAPH_AUTOENCODER(nn.Module):
                 return cls_output, x_recon, adj_recon_list
             else:
                 return cls_output, x_recon, masked_outputs
-        return cls_output, x_recon
+        return cls_output, x_recon, atom_number_pred
     
 
 #%%
@@ -1258,10 +1211,10 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
                 epoch_results[epoch]['recalls'].append(recall)
                 epoch_results[epoch]['f1s'].append(f1)
 
-            # run() 함수 내에서 평가 시점에 다음 코드 추가
-            cls_embeddings_pca, explained_variance_ratio, eigenvalues = analyze_cls_embeddings(model, test_loader, epoch, device)
+            # # run() 함수 내에서 평가 시점에 다음 코드 추가
+            # cls_embeddings_pca, explained_variance_ratio, eigenvalues = analyze_cls_embeddings(model, test_loader, epoch, device)
 
-    return auroc, epoch_results, cls_embeddings_pca, explained_variance_ratio, eigenvalues
+    return auroc, epoch_results
 
 
 #%%
@@ -1276,7 +1229,7 @@ if __name__ == '__main__':
     for trial in range(n_cross_val):
         fold_start = time.time()  # 현재 폴드 시작 시간
         print(f"Starting fold {trial + 1}/{n_cross_val}")
-        ad_auc, epoch_results, cls_embeddings_pca, explained_variance_ratio, eigenvalues = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
+        ad_auc, epoch_results = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
         ad_aucs.append(ad_auc)
         
         fold_end = time.time()  # 현재 폴드 종료 시간   

@@ -121,7 +121,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             node_loss += node_loss_
             
             if epoch % 5 == 0:
-                node_loss_scaled = node_loss.item() * alpha
+                node_loss_scaled = node_loss_.item() * alpha
                 cls_vec = train_cls_outputs[i].detach().cpu().numpy()
                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
                 min_distance = distances.min().item() * gamma
@@ -147,6 +147,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
         #     cls_loss = cls_distances.mean()
         # else:
         #     cls_loss = torch.tensor(0.0, device=device)
+        
         center = torch.mean(train_cls_outputs, dim=0)  # 현재 배치의 CLS 출력 평균
         cls_loss = torch.mean(torch.norm(train_cls_outputs - center, dim=1))  # 평균으로부터의 거리
         

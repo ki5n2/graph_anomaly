@@ -54,7 +54,7 @@ from scipy.sparse import csr_matrix
 from scipy.sparse.csgraph import shortest_path
 
 from modules.loss import loss_cal
-from modules.utils import set_seed, set_device, EarlyStopping, get_ad_split_TU, get_data_loaders_TU, adj_original
+from modules.utils import set_seed, set_device, EarlyStopping, get_ad_split_TU, get_data_loaders_TU, adj_original, split_batch_graphs, compute_persistence_and_betti, process_batch_graphs, scott_rule_bandwidth, loocv_bandwidth_selection
 
 import networkx as nx
 
@@ -122,7 +122,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             node_loss += node_loss_
             
             if epoch % 5 == 0:
-                node_loss_scaled = node_loss.item() * alpha
+                node_loss_scaled = node_loss_.item() * alpha
                 cls_vec = train_cls_outputs[i].detach().cpu().numpy()
                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
                 min_distance = distances.min().item() * gamma
@@ -135,13 +135,19 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             
             start_node = end_node
 
-        homology_labels = calculate_homology_features(x, edge_index, batch).to(device)
-        homology_loss = F.mse_loss(homology_preds, homology_labels)
+        # homology_labels = calculate_homology_features(x, edge_index, batch).to(device)
+        # homology_loss = F.mse_loss(homology_preds, homology_labels)
 
-        loss = node_loss + homology_loss
+        graph_properties = compute_graph_properties(data, batch)
+        structure_loss = F.mse_loss(homology_preds, graph_properties)
+        
+        alpha_ = 10
+        structure_loss = alpha_ * structure_loss
+        
+        loss = node_loss + structure_loss
         
         print(f'node_loss: {node_loss}')
-        print(f'homology_loss: {homology_loss}')
+        print(f'structure_loss: {structure_loss}')
         
         num_sample += num_graphs
         loss.backward()
@@ -244,7 +250,11 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
                             for error in reconstruction_errors_test if error['type'] == 'test_anomaly'])
     
     # 밀도 기반 스코어링 적용
-    density_scorer = DensityBasedScoring(bandwidth=0.5)
+    # # Scott의 규칙 적용
+    bandwidth = scott_rule_bandwidth(train_data)
+    # LOOCV 적용
+    # bandwidth, _ = loocv_bandwidth_selection(train_data)
+    density_scorer = DensityBasedScoring(bandwidth=bandwidth)
     density_scorer.fit(train_data)
     
     # 이상 스코어 계산
@@ -646,16 +656,29 @@ def calculate_homology_features(x, edge_index, batch):
     features = []
     unique_batches = batch.unique()
     num_nodes = batch.size(0)
-    for graph_id in batch.unique():
+    for graph_id in unique_batches:
         # 그래프 추출
         mask = batch == graph_id
-        node_indices = mask.nonzero(as_tuple=True)[0]
-        sub_edge_index, _ = subgraph(node_indices, edge_index, relabel_nodes=True)
+        node_indices = mask.nonzero().squeeze(1)  # Changed this line
+        # node_indices = mask.nonzero(as_tuple=True)[0]
         
+        # 에러 방지를 위한 디바이스 확인 및 CPU로 이동
+        node_indices = node_indices.cpu()
+        edge_index_cpu = edge_index.cpu()
+        
+        # subgraph 함수 호출 수정
+        sub_edge_index, edge_attr = subgraph(
+            node_indices, 
+            edge_index_cpu,
+            relabel_nodes=True,
+            num_nodes=num_nodes
+        )
+                
         # NetworkX 그래프로 변환
         nx_graph = nx.Graph()
         nx_graph.add_nodes_from(range(len(node_indices)))
-        nx_graph.add_edges_from(sub_edge_index.t().tolist())
+        edge_list = sub_edge_index.t().tolist()
+        nx_graph.add_edges_from(edge_list)
         
         # H₀: 연결 성분 개수
         H0 = nx.number_connected_components(nx_graph)
@@ -664,27 +687,67 @@ def calculate_homology_features(x, edge_index, batch):
         H1 = nx.number_of_edges(nx_graph) - nx.number_of_nodes(nx_graph) + H0
         
         # 고리 크기 분포
-        cycles = nx.cycle_basis(nx_graph)
-        cycle_sizes = [len(cycle) for cycle in cycles]
-        if len(cycle_sizes) > 0:
-            avg_cycle_size = sum(cycle_sizes) / len(cycle_sizes)
-            max_cycle_size = max(cycle_sizes)
-            min_cycle_size = min(cycle_sizes)
-        else:
+        try:
+            cycles = nx.cycle_basis(nx_graph)
+            cycle_sizes = [len(cycle) for cycle in cycles]
+            
+            if len(cycle_sizes) > 0:
+                avg_cycle_size = sum(cycle_sizes) / len(cycle_sizes)
+                max_cycle_size = max(cycle_sizes)
+                min_cycle_size = min(cycle_sizes)
+            else:
+                avg_cycle_size = 0.0
+                max_cycle_size = 0.0
+                min_cycle_size = 0.0
+                
+            # 방향족 고리 비율
+            aromaticity = [len(cycle) == 6 for cycle in cycles]
+            aromatic_ratio = sum(aromaticity) / len(aromaticity) if len(aromaticity) > 0 else 0.0
+            
+        except nx.NetworkXNoCycle:
             avg_cycle_size = 0.0
             max_cycle_size = 0.0
             min_cycle_size = 0.0
-        
-        # 방향족 고리 비율
-        aromaticity = [len(cycle) == 6 for cycle in cycles]
-        aromatic_ratio = sum(aromaticity) / len(aromaticity) if len(aromaticity) > 0 else 0.0
+            aromatic_ratio = 0.0
         
         # 고정된 크기의 벡터로 변환
         features.append([H0, H1, avg_cycle_size, max_cycle_size, min_cycle_size, aromatic_ratio])
     
-    return torch.tensor(features, dtype=torch.float32)
+    # 결과를 텐서로 변환하여 원래 디바이스로 반환
+    return torch.tensor(features, dtype=torch.float32).to(batch.device)
 
+
+def compute_graph_properties(data, batch):
+    properties = []
+    for i in range(batch.max() + 1):
+        mask = (batch == i)
+        sub_edge_index = data.edge_index[:, mask[data.edge_index[0]] & mask[data.edge_index[1]]]
+        num_nodes = mask.sum().item()
+        num_edges = sub_edge_index.size(1)
+        
+        # 1. Average degree
+        avg_degree = (2 * num_edges) / num_nodes
+        
+        # 2. Graph density
+        density = (2 * num_edges) / (num_nodes * (num_nodes - 1)) if num_nodes > 1 else 0
+        
+        # 3. Clustering coefficient approximation
+        adj = to_dense_adj(sub_edge_index)[0]
+        tri = torch.matmul(torch.matmul(adj, adj), adj).trace() / 6
+        possible_tri = torch.sum(torch.combinations(torch.arange(num_nodes), r=3))
+        clustering_coef = tri / possible_tri if possible_tri > 0 else 0
+        
+        # 4. Diameter approximation (using max of shortest paths between sample node pairs)
+        G = to_networkx(Data(edge_index=sub_edge_index, num_nodes=num_nodes))
+        sample_nodes = random.sample(range(num_nodes), min(5, num_nodes))
+        paths = [nx.shortest_path_length(G, source=i) for i in sample_nodes]
+        diameter = max([max(p.values()) for p in paths]) if paths else 0
+        
+        properties.append([avg_degree, density, clustering_coef, diameter])
     
+    return torch.tensor(properties, device=data.edge_index.device)
+
+
 #%%
 '''ARGPARSER'''
 parser = argparse.ArgumentParser()
@@ -1232,7 +1295,7 @@ class GRAPH_AUTOENCODER(nn.Module):
         self.homology_predictor = nn.Sequential(
             nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
             nn.ReLU(),
-            nn.Linear(hidden_dims[-1] // 2, 6)  # H0, H1, cycle_size 평균, 방향족 비율
+            nn.Linear(hidden_dims[-1] // 2, 4)  # H0, H1, cycle_size 평균, 방향족 비율
         )
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):

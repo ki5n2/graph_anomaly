@@ -121,7 +121,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
             node_loss += node_loss_
             
             if epoch % 5 == 0:
-                node_loss_scaled = node_loss.item() * alpha
+                node_loss_scaled = node_loss_.item() * alpha
                 cls_vec = train_cls_outputs[i].detach().cpu().numpy()
                 distances = cdist([cls_vec], cluster_centers, metric='euclidean')
                 min_distance = distances.min().item() * gamma

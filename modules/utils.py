@@ -1,8 +1,10 @@
 import re
 import os
+import gc
 import torch
 import random
 import numpy as np
+import gudhi as gd
 import os.path as osp
 
 from torch_geometric.data import Data
@@ -11,9 +13,19 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.datasets import TUDataset
 from torch_geometric.transforms import Constant
 from sklearn.model_selection import StratifiedKFold
+from sklearn.model_selection import LeaveOneOut
+from sklearn.neighbors import KernelDensity
+from scipy.stats import norm
+from scipy.spatial.distance import pdist, squareform
 from torch_geometric.utils import to_dense_adj, to_undirected, to_networkx, to_scipy_sparse_matrix, degree, from_networkx
 
 import networkx as nx
+
+# 메모리 설정
+torch.cuda.empty_cache()
+gc.collect()
+
+
 
 def set_seed(random_seed):
     torch.manual_seed(random_seed)
@@ -850,4 +862,510 @@ def get_ad_dataset_Tox21(dataset_name, batch_size, test_batch_size, need_str_enc
     
     return loader_dict, meta
 
+
+# def compute_persistence_and_betti(graph_distance_matrix, max_dimension=2):
+#     try:
+#         # Rips Complex 생성
+#         rips_complex = gd.RipsComplex(distance_matrix=graph_distance_matrix, max_edge_length=2.0)
+#         simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
+        
+#         # Persistent Homology 계산
+#         simplex_tree.compute_persistence()
+        
+#         # persistence diagram 가져오기
+#         persistence_diagram = simplex_tree.persistence()
+        
+#         if persistence_diagram:
+#             min_val = min(min(birth, death if death != float('inf') else birth) 
+#                          for _, (birth, death) in persistence_diagram)
+#             max_val = max(max(birth, death if death != float('inf') else birth) 
+#                          for _, (birth, death) in persistence_diagram)
+#         else:
+#             min_val, max_val = 0.0, 2.0
+        
+#         # Betti Numbers 계산
+#         betti_numbers = simplex_tree.persistent_betti_numbers(min_val, max_val)
+        
+#         return persistence_diagram, betti_numbers
+#     except Exception as e:
+#         print(f"Error in persistence computation: {str(e)}")
+#         return [], [0, 0, 0]
+
+
+# def compute_persistence_and_betti(graph_distance_matrix, dataset_name, max_dimension=2):
+#     try:
+#         # 입력 검증
+#         if not isinstance(graph_distance_matrix, np.ndarray):
+#             return [], [0, 0, 0]
+        
+#         if graph_distance_matrix.size == 0:
+#             return [], [0, 0, 0]
+            
+#         # 메모리 제한을 위한 크기 체크
+#         if graph_distance_matrix.shape[0] > 100:
+#             # 큰 행렬은 샘플링
+#             indices = np.random.choice(graph_distance_matrix.shape[0], 100, replace=False)
+#             graph_distance_matrix = graph_distance_matrix[indices][:, indices]
+        
+#         # GUDHI 계산
+#         if dataset_name == 'AIDS':
+#             max_dimension = 1
+#         else:
+#             max_dimension = 2
+#         rips = gd.RipsComplex(distance_matrix=graph_distance_matrix)
+#         st = rips.create_simplex_tree(max_dimension=max_dimension)  # 차원 제한
+#         st.compute_persistence()
+        
+#         # 결과 추출
+#         persistence = st.persistence()
+#         betti = st.persistent_betti_numbers(0, 2.0)
+        
+#         # 메모리 정리
+#         del rips
+#         del st
+#         gc.collect()
+        
+#         return persistence, betti
+        
+#     except Exception as e:
+#         print(f"Error in safe_compute_persistence_and_betti: {str(e)}")
+#         return [], [0, 0, 0]
+
+
+# def merge_persistence_results(persistence_results):
+#     # 모든 persistence diagram 병합
+#     merged = []
+#     for diagram in persistence_results:
+#         merged.extend(diagram)
+    
+#     # 중복 제거 및 정렬
+#     merged = list(set(merged))
+#     merged.sort(key=lambda x: (x[1][0], x[1][1]))
+    
+#     return merged
+
+# def compute_merged_betti(persistence_results):
+#     # 각 차원별 Betti 수 계산
+#     betti = [0, 0, 0]
+#     for diagram in persistence_results:
+#         for dim, (birth, death) in diagram:
+#             if dim < len(betti) and death != float('inf'):
+#                 betti[dim] += 1
+    
+#     return betti
+
+
+# def process_batch_graphs(data):
+#     graphs = split_batch_graphs(data)
+#     true_stats_list = []
+    
+#     print(f"\nProcessing {len(graphs)} graphs...")
+    
+#     for i, (x, edge_index) in enumerate(graphs):
+#         try:
+#             # 거리 행렬 계산
+#             distance_matrix = squareform(pdist(x.cpu().numpy(), metric='euclidean'))
+            
+#             # Persistent Homology 계산
+#             persistence_diagram, betti_numbers = compute_persistence_and_betti(distance_matrix)
+            
+#             # 통계 추출
+#             stats = {
+#                 "mean_survival": np.mean([death - birth for _, (birth, death) in persistence_diagram 
+#                                         if death != float('inf')]) if persistence_diagram else 0.0,
+#                 "max_survival": np.max([death - birth for _, (birth, death) in persistence_diagram 
+#                                       if death != float('inf')]) if persistence_diagram else 0.0,
+#                 "variance_survival": np.var([death - birth for _, (birth, death) in persistence_diagram 
+#                                            if death != float('inf')]) if persistence_diagram else 0.0,
+#                 "mean_birth": np.mean([birth for _, (birth, death) in persistence_diagram]) if persistence_diagram else 0.0,
+#                 "mean_death": np.mean([death for _, (birth, death) in persistence_diagram 
+#                                      if death != float('inf')]) if persistence_diagram else 0.0,
+#                 "betti_0": betti_numbers[0] if len(betti_numbers) > 0 else 0,
+#                 "betti_1": betti_numbers[1] if len(betti_numbers) > 1 else 0,
+#                 "betti_2": betti_numbers[2] if len(betti_numbers) > 2 else 0
+#             }
+            
+#             true_stats_list.append(stats)
+            
+#             if i % 50 == 0:  # 50개 그래프마다 진행상황 출력
+#                 print(f"Processed {i}/{len(graphs)} graphs")
+                
+#         except Exception as e:
+#             print(f"Error processing graph {i}: {str(e)}")
+#             true_stats_list.append({
+#                 "mean_survival": 0.0, "max_survival": 0.0, "variance_survival": 0.0,
+#                 "mean_birth": 0.0, "mean_death": 0.0,
+#                 "betti_0": 0, "betti_1": 0, "betti_2": 0
+#             })
+    
+#     # 모든 통계를 tensor로 변환
+#     true_stats_tensor = torch.tensor([
+#         [stats['mean_survival'], stats['max_survival'], stats['variance_survival'],
+#          stats['mean_birth'], stats['mean_death'],
+#          stats['betti_0'], stats['betti_1'], stats['betti_2']]
+#         for stats in true_stats_list
+#     ], dtype=torch.float32)
+    
+#     # 데이터에 통계 추가
+#     data.true_stats = true_stats_tensor
+    
+#     print("\nProcessing completed!")
+#     print(f"Final statistics shape: {data.true_stats.shape}")
+    
+#     # 처음 몇 개 그래프의 통계 출력
+#     print("\nFirst few graphs statistics:")
+#     for i in range(min(3, len(true_stats_list))):
+#         print(f"\nGraph {i}:")
+#         print(f"Betti numbers: β₀={true_stats_list[i]['betti_0']}, "
+#               f"β₁={true_stats_list[i]['betti_1']}, β₂={true_stats_list[i]['betti_2']}")
+#         print(f"Mean survival: {true_stats_list[i]['mean_survival']:.4f}")
+#         print(f"Max survival: {true_stats_list[i]['max_survival']:.4f}")
+    
+#     return data
+
+
+# def process_batch_graphs(data, dataset_name):
+#     """최소한의 기능으로 구현한 배치 처리"""
+#     try:
+#         graphs = split_batch_graphs(data)
+#         true_stats_list = []
+        
+#         for i, (x, edge_index) in enumerate(graphs):
+#             try:
+#                 # CPU로 이동하고 numpy로 변환
+#                 x_np = x.cpu().detach().numpy()
+                
+#                 # 작은 그래프만 처리
+#                 if x_np.shape[0] <= 100:
+#                     distance_matrix = squareform(pdist(x_np))
+#                     persistence_diagram, betti_numbers = compute_persistence_and_betti(distance_matrix, dataset_name)
+#                 else:
+#                     # 큰 그래프는 기본값 사용
+#                     persistence_diagram, betti_numbers = [], [0, 0, 0]
+                
+#                 # 통계 계산
+#                 stats = {
+#                     "mean_survival": 0.0,
+#                     "max_survival": 0.0,
+#                     "variance_survival": 0.0,
+#                     "mean_birth": 0.0,
+#                     "mean_death": 0.0,
+#                     "betti_0": betti_numbers[0] if len(betti_numbers) > 0 else 0,
+#                     "betti_1": betti_numbers[1] if len(betti_numbers) > 1 else 0,
+#                     "betti_2": betti_numbers[2] if len(betti_numbers) > 2 else 0
+#                 }
+                
+#                 if persistence_diagram:
+#                     survivals = [death - birth for _, (birth, death) in persistence_diagram 
+#                                if death != float('inf')]
+#                     if survivals:
+#                         stats["mean_survival"] = float(np.mean(survivals))
+#                         stats["max_survival"] = float(np.max(survivals))
+#                         stats["variance_survival"] = float(np.var(survivals))
+                
+#                 true_stats_list.append(stats)
+                
+#             except Exception as e:
+#                 print(f"Error processing graph {i}: {str(e)}")
+#                 true_stats_list.append(get_default_stats())
+            
+#             # 각 그래프 처리 후 메모리 정리
+#             gc.collect()
+        
+#         # 결과를 텐서로 변환
+#         true_stats_tensor = torch.tensor([
+#             [stats['mean_survival'], stats['max_survival'], stats['variance_survival'],
+#              stats['mean_birth'], stats['mean_death'],
+#              stats['betti_0'], stats['betti_1'], stats['betti_2']]
+#             for stats in true_stats_list
+#         ], dtype=torch.float32)
+        
+#         data.true_stats = true_stats_tensor
+#         return data
+        
+#     except Exception as e:
+#         print(f"Error in process_batch_graphs: {str(e)}")
+#         # 오류 발생시 기본값으로 채운 텐서 반환
+#         data.true_stats = torch.zeros((len(graphs), 8), dtype=torch.float32)
+#         return data
+
+
+# def calculate_persistence_stats(persistence_diagram, betti_numbers):
+#     """통계 계산을 위한 헬퍼 함수"""
+#     return {
+#         "mean_survival": np.mean([death - birth for _, (birth, death) in persistence_diagram 
+#                                 if death != float('inf')]) if persistence_diagram else 0.0,
+#         "max_survival": np.max([death - birth for _, (birth, death) in persistence_diagram 
+#                               if death != float('inf')]) if persistence_diagram else 0.0,
+#         "variance_survival": np.var([death - birth for _, (birth, death) in persistence_diagram 
+#                                    if death != float('inf')]) if persistence_diagram else 0.0,
+#         "mean_birth": np.mean([birth for _, (birth, death) in persistence_diagram]) if persistence_diagram else 0.0,
+#         "mean_death": np.mean([death for _, (birth, death) in persistence_diagram 
+#                              if death != float('inf')]) if persistence_diagram else 0.0,
+#         "betti_0": betti_numbers[0] if len(betti_numbers) > 0 else 0,
+#         "betti_1": betti_numbers[1] if len(betti_numbers) > 1 else 0,
+#         "betti_2": betti_numbers[2] if len(betti_numbers) > 2 else 0
+#     }
+
+
+# def get_default_stats():
+#     """기본 통계값 반환"""
+#     return {
+#         "mean_survival": 0.0, "max_survival": 0.0, "variance_survival": 0.0,
+#         "mean_birth": 0.0, "mean_death": 0.0,
+#         "betti_0": 0, "betti_1": 0, "betti_2": 0
+#     }
+
+
+# def print_statistics_summary(true_stats_list):
+#     """통계 요약 출력"""
+#     print("\nProcessing completed!")
+#     print(f"Final statistics shape: {len(true_stats_list)}")
+    
+#     print("\nFirst few graphs statistics:")
+#     for i in range(min(3, len(true_stats_list))):
+#         print(f"\nGraph {i}:")
+#         print(f"Betti numbers: β₀={true_stats_list[i]['betti_0']}, "
+#               f"β₁={true_stats_list[i]['betti_1']}, β₂={true_stats_list[i]['betti_2']}")
+#         print(f"Mean survival: {true_stats_list[i]['mean_survival']:.4f}")
+#         print(f"Max survival: {true_stats_list[i]['max_survival']:.4f}")
+
+
+# def merge_persistence_diagrams(persistence_diagrams):
+#     """여러 persistence diagram을 하나로 병합"""
+#     merged = []
+#     for diagram in persistence_diagrams:
+#         if diagram:  # 빈 다이어그램이 아닌 경우에만 처리
+#             merged.extend(diagram)
+    
+#     if not merged:  # 모든 다이어그램이 비어있는 경우
+#         return []
+    
+#     # 중복 제거 및 정렬
+#     # 튜플의 리스트를 집합으로 변환할 수 없으므로, 비교 가능한 형태로 변환
+#     unique_pairs = set((dim, birth, death) for dim, (birth, death) in merged)
+    
+#     # 다시 원래 형식으로 변환하고 정렬
+#     merged = [(dim, (birth, death)) for dim, birth, death in unique_pairs]
+#     merged.sort(key=lambda x: (x[0], x[1][0], x[1][1]))  # 차원, birth, death 순으로 정렬
+    
+#     return merged
+
+# def merge_betti_numbers(betti_numbers_list):
+#     """여러 Betti number 리스트를 하나로 병합"""
+#     if not betti_numbers_list:
+#         return [0, 0, 0]
+    
+#     # 각 차원별로 최대값 선택
+#     max_betti = []
+#     for dim in range(3):  # 0, 1, 2 차원에 대해
+#         max_val = max(betti[dim] if len(betti) > dim else 0 
+#                      for betti in betti_numbers_list)
+#         max_betti.append(max_val)
+    
+#     return max_betti
+
+
+# def scott_rule_bandwidth(X):
+#     """
+#     Scott의 규칙을 사용하여 KDE의 최적 bandwidth를 계산합니다.
+    
+#     Parameters:
+#     -----------
+#     X : array-like of shape (n_samples, n_features)
+#         입력 데이터
+    
+#     Returns:
+#     --------
+#     bandwidth : float
+#         Scott의 규칙으로 계산된 optimal bandwidth
+#     """
+#     n = len(X)
+#     d = X.shape[1]  # 특징 차원
+    
+#     # 각 차원별 표준편차 계산
+#     sigma = np.std(X, axis=0)
+    
+#     # Scott의 규칙: h = n^(-1/(d+4)) * sigma
+#     bandwidth = np.power(n, -1./(d+4)) * sigma
+    
+#     # 다변량의 경우 기하평균 사용
+#     if d > 1:
+#         bandwidth = np.prod(bandwidth) ** (1./d)
+        
+#     return bandwidth
+
+# def loocv_bandwidth_selection(X, bandwidths=None, cv=None):
+#     """
+#     Leave-one-out 교차 검증을 사용하여 최적의 bandwidth를 선택합니다.
+    
+#     Parameters:
+#     -----------
+#     X : array-like of shape (n_samples, n_features)
+#         입력 데이터
+#     bandwidths : array-like, optional
+#         테스트할 bandwidth 값들. None이면 자동으로 범위 생성
+#     cv : int, cross-validation generator or iterable, optional
+#         교차 검증 분할기. None이면 LeaveOneOut 사용
+    
+#     Returns:
+#     --------
+#     optimal_bandwidth : float
+#         LOOCV로 선택된 optimal bandwidth
+#     cv_scores : dict
+#         각 bandwidth에 대한 교차 검증 점수
+#     """
+#     if bandwidths is None:
+#         # Scott의 규칙으로 초기 추정치를 구하고 그 주변 값들을 테스트
+#         scott_bw = scott_rule_bandwidth(X)
+#         bandwidths = np.logspace(np.log10(scott_bw/5), np.log10(scott_bw*5), 20)
+    
+#     if cv is None:
+#         cv = LeaveOneOut()
+    
+#     n_samples = X.shape[0]
+#     cv_scores = {bw: 0.0 for bw in bandwidths}
+    
+#     for train_idx, test_idx in cv.split(X):
+#         X_train = X[train_idx]
+#         X_test = X[test_idx]
+        
+#         for bw in bandwidths:
+#             # 현재 bandwidth로 KDE 학습
+#             kde = KernelDensity(bandwidth=bw, kernel='gaussian')
+#             kde.fit(X_train)
+            
+#             # 테스트 샘플의 log-likelihood 계산
+#             log_likelihood = kde.score(X_test)
+#             cv_scores[bw] += log_likelihood
+    
+#     # 평균 log-likelihood가 가장 높은 bandwidth 선택
+#     optimal_bandwidth = max(cv_scores.items(), key=lambda x: x[1])[0]
+    
+#     return optimal_bandwidth, cv_scores
+
+
+def split_batch_graphs(data):
+    graphs = []
+    # ptr을 사용하여 각 그래프의 경계를 찾음
+    for i in range(len(data.ptr) - 1):
+        start, end = data.ptr[i].item(), data.ptr[i + 1].item()
+        # 해당 그래프의 노드 특성
+        x = data.x[start:end]
+        # 해당 그래프의 엣지 인덱스 추출 및 조정
+        mask = (data.edge_index[0] >= start) & (data.edge_index[1] < end)
+        edge_index = data.edge_index[:, mask]
+        edge_index = edge_index - start  # 노드 인덱스 조정
+        graphs.append((x, edge_index))
+    return graphs
+
+
+def compute_persistence(graph_distance_matrix):
+    """Persistence diagram만 계산하는 최적화된 함수"""
+    try:
+        if not isinstance(graph_distance_matrix, np.ndarray) or graph_distance_matrix.size == 0:
+            return []
+            
+        # 더 효율적인 샘플링
+        if graph_distance_matrix.shape[0] > 100:
+            # 균일한 간격으로 샘플링하여 더 대표성 있는 부분집합 선택
+            step = graph_distance_matrix.shape[0] // 100
+            indices = np.arange(0, graph_distance_matrix.shape[0], step)[:100]
+            graph_distance_matrix = graph_distance_matrix[indices][:, indices]
+        
+        # 최소한의 차원과 계산만 수행
+        rips = gd.RipsComplex(distance_matrix=graph_distance_matrix)
+        st = rips.create_simplex_tree(max_dimension=1)  # 1차원까지만 계산
+        st.persistence()  # 결과 저장 없이 바로 반환
+        persistence = [(dim, (birth, death)) for dim, (birth, death) in st.persistence() 
+                      if death != float('inf')]  # 무한대 값 필터링
+        
+        del rips, st
+        return persistence
+        
+    except Exception as e:
+        print(f"Error in persistence computation: {str(e)}")
+        return []
+    
+
+def process_batch_graphs(data):
+    try:
+        graphs = split_batch_graphs(data)
+        stats_list = []
+        
+        for i, (x, _) in enumerate(graphs):
+            try:
+                x_np = x.cpu().detach().numpy()
+                distance_matrix = squareform(pdist(x_np))
+                persistence = compute_persistence(distance_matrix)
+                
+                if not persistence:
+                    stats_list.append(np.zeros(5, dtype=np.float32))
+                    continue
+                
+                # 한 번의 순회로 모든 통계 계산
+                births, deaths = zip(*[birth_death for _, birth_death in persistence])
+                survivals = np.array([d - b for b, d in zip(births, deaths)])
+                
+                stats = np.array([
+                    np.mean(survivals),
+                    np.max(survivals),
+                    np.var(survivals) if len(survivals) > 1 else 0,
+                    np.mean(births),
+                    np.mean(deaths)
+                ], dtype=np.float32)
+                
+                stats_list.append(stats)
+                
+            except Exception as e:
+                print(f"Error processing graph {i}: {str(e)}")
+                stats_list.append(np.zeros(5, dtype=np.float32))
+            
+            # 더 효율적인 메모리 관리
+            if i % 50 == 0:
+                gc.collect()
+        
+        # 한 번에 텐서로 변환
+        data.true_stats = torch.tensor(stats_list, dtype=torch.float32)
+        return data
+        
+    except Exception as e:
+        print(f"Error in process_batch_graphs: {str(e)}")
+        data.true_stats = torch.zeros((len(graphs), 5), dtype=torch.float32)
+        return data
+    
+    
+def scott_rule_bandwidth(X):
+    n = len(X)
+    d = X.shape[1]  # 특징 차원
+    sigma = np.std(X, axis=0)  # 각 차원별 표준편차
+    bandwidth = np.power(n, -1./(d+4)) * sigma
+    if d > 1:
+        bandwidth = np.prod(bandwidth) ** (1./d)  # 다변량의 경우 기하평균 사용
+    return bandwidth
+
+def loocv_bandwidth_selection(X, bandwidths=None, cv=None, range_factor=5):
+    if bandwidths is None:
+        scott_bw = scott_rule_bandwidth(X)
+        bandwidths = np.logspace(np.log10(scott_bw/range_factor), 
+                                 np.log10(scott_bw*range_factor), 20)
+    
+    if cv is None:
+        cv = LeaveOneOut()
+    
+    n_samples = X.shape[0]
+    cv_scores = {bw: 0.0 for bw in bandwidths}
+    
+    for train_idx, test_idx in cv.split(X):
+        X_train = X[train_idx]
+        X_test = X[test_idx]
+        
+        for bw in bandwidths:
+            kde = KernelDensity(bandwidth=bw, kernel='gaussian')
+            kde.fit(X_train)
+            log_likelihood = kde.score_samples(X_test)[0]  # 단일 샘플 점수
+            cv_scores[bw] += log_likelihood / n_samples  # 평균 점수로 누적
+    
+    optimal_bandwidth = max(cv_scores.items(), key=lambda x: x[1])[0]
+    return optimal_bandwidth, cv_scores
 
