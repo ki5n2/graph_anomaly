@@ -3,6 +3,8 @@
 # python argparse source for experiments
 experiments=(
 "--dataset-name Tox21_p53 --random-seed 1 --epochs 100 --n-cluster 1 --learning-rate 0.0001"
+"--dataset-name Tox21_MMP --random-seed 1 --epochs 100 --n-cluster 1 --learning-rate 0.0001"
+"--dataset-name Tox21_HSE --random-seed 1 --epochs 100 --n-cluster 1 --learning-rate 0.0001"
 )
 
 # default prefix of job name

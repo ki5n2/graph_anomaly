@@ -199,7 +199,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
     
     with torch.no_grad():
         for data in test_loader:
-            data = process_batch_graphs(data)
+            data = process_batch_graphs(data, dataset_name)
             data = data.to(device)
             x, edge_index, batch, num_graphs, node_label, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.node_label, data.true_stats
             e_cls_output, x_recon, stats_pred = model(x, edge_index, batch, num_graphs)
@@ -704,9 +704,9 @@ def persistence_stats_loss(pred_stats, true_stats):
     continuous_loss = F.mse_loss(pred_stats[:, :5], true_stats[:, :5])
     
     # Cross Entropy Loss for Betti numbers (if needed)
-    betti_loss = F.mse_loss(pred_stats[:, 5:], true_stats[:, 5:])
+    # betti_loss = F.mse_loss(pred_stats[:, 5:], true_stats[:, 5:])
     
-    return continuous_loss + betti_loss
+    return continuous_loss
 
 
 #%%

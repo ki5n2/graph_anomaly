@@ -15,12 +15,14 @@ import numpy as np
 import gudhi as gd
 import seaborn as sns
 import torch.nn as nn
+import numpy.typing as npt
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torch_geometric.utils as utils
 
 from torch.nn import init
+from typing import List, Tuple, Dict, Any
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from torch_geometric.data import Data, Batch
@@ -33,7 +35,7 @@ from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, globa
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
-from scipy.stats import wasserstein_distance
+from scipy.stats import linregress
 from scipy.spatial.distance import pdist, squareform
 from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score, silhouette_score, silhouette_samples
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, LeaveOneOut
@@ -97,11 +99,12 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
     reconstruction_errors = []
     
     for data in train_loader:
-        data = process_batch_graphs(data, dataset_name)
-        recon_optimizer.zero_grad()
+        data = TopER_Embedding(data)  # TopER 임베딩 계산
         data = data.to(device)
-        x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
-                
+        recon_optimizer.zero_grad()
+        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        toper_target = data.toper_embeddings
+        
         train_cls_outputs, x_recon, stats_pred = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
@@ -134,9 +137,9 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
             
             start_node = end_node
             
-        stats_loss = persistence_stats_loss(stats_pred, true_stats)
+        stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        alpha_ = 100
+        alpha_ = 10
         stats_loss = alpha_ * stats_loss
         
         loss = node_loss + stats_loss
@@ -494,6 +497,151 @@ def persistence_stats_loss(pred_stats, true_stats):
     # betti_loss = F.mse_loss(pred_stats[:, 5:], true_stats[:, 5:])
     
     return continuous_loss
+
+
+#%%
+class PyGTopER:
+    def __init__(self, thresholds: List[float]):
+        # thresholds를 float32로 변환
+        self.thresholds = torch.tensor(sorted(thresholds), dtype=torch.float32)
+
+    
+    def _get_graph_structure(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                           batch: torch.Tensor, graph_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 모든 텐서를 float32로 변환
+        x = x.float()  # float32로 명시적 변환
+        
+        # CPU로 이동 및 처리
+        x = x.cpu()
+        edge_index = edge_index.cpu()
+        batch = batch.cpu()
+        
+        mask = batch == graph_idx
+        nodes = x[mask]
+        
+        node_idx = torch.arange(len(batch), dtype=torch.long, device='cpu')[mask]
+        idx_map = {int(old): new for new, old in enumerate(node_idx)}
+        
+        edge_mask = mask[edge_index[0]] & mask[edge_index[1]]
+        graph_edges = edge_index[:, edge_mask]
+        
+        graph_edges = torch.tensor([[idx_map[int(i)] for i in graph_edges[0]],
+                                  [idx_map[int(i)] for i in graph_edges[1]]], 
+                                 dtype=torch.long,  # long 타입 명시
+                                 device='cpu')
+        
+        return nodes, graph_edges
+    
+    def _get_node_filtration(self, nodes: torch.Tensor, edges: torch.Tensor, 
+                            node_values: torch.Tensor) -> List[Tuple[int, int]]:
+        """Compute filtration sequence for a single graph"""
+        sequences = []
+        for threshold in self.thresholds:
+            # Get nodes below threshold
+            mask = node_values <= threshold
+            if not torch.any(mask):
+                sequences.append((0, 0))
+                continue
+                
+            # Get induced edges
+            edge_mask = mask[edges[0]] & mask[edges[1]]
+            filtered_edges = edges[:, edge_mask]
+            
+            sequences.append((torch.sum(mask).item(), 
+                            filtered_edges.shape[1] // 2))
+            
+        return sequences
+
+    def _compute_degree_values(self, num_nodes: int, edges: torch.Tensor) -> torch.Tensor:
+        degrees = torch.zeros(num_nodes, dtype=torch.float32, device='cpu')  # float32 명시
+        unique, counts = torch.unique(edges[0], return_counts=True)
+        degrees[unique] += counts.float()  # counts를 float32로 변환
+        return degrees
+    
+    def _compute_popularity_values(self, num_nodes: int, edges: torch.Tensor) -> torch.Tensor:
+        """Compute popularity values as defined in the paper"""
+        degrees = self._compute_degree_values(num_nodes, edges)
+        
+        popularity = torch.zeros(num_nodes, device='cpu')
+        for i in range(num_nodes):
+            neighbors = edges[1][edges[0] == i]
+            if len(neighbors) > 0:
+                neighbor_degrees = degrees[neighbors]
+                popularity[i] = degrees[i] + neighbor_degrees.mean()
+            else:
+                popularity[i] = degrees[i]
+                
+        return popularity
+    
+    def _refine_sequences(self, x_vals: np.ndarray, y_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Refine sequences according to the paper's methodology"""
+        refined_x = []
+        refined_y = []
+        i = 0
+        while i < len(y_vals):
+            # Find consecutive points with same y value
+            j = i + 1
+            while j < len(y_vals) and y_vals[j] == y_vals[i]:
+                j += 1
+            
+            # Calculate mean of x values
+            x_mean = x_vals[i:j].mean()
+            refined_x.append(x_mean)
+            refined_y.append(y_vals[i])
+            
+            i = j
+            
+        return np.array(refined_x), np.array(refined_y)
+    
+    def _fit_line(self, x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """Fit line to refined sequences with float32 precision"""
+        if len(x) < 2:
+            return 0.0, 0.0
+            
+        slope, intercept, _, _, _ = linregress(x.astype(np.float32), y.astype(np.float32))
+        return float(intercept), float(slope)  # float32 반환
+
+    def compute_embeddings(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                          batch: torch.Tensor, filtration: str = 'degree') -> torch.Tensor:
+        device = x.device
+        num_graphs = batch.max().item() + 1
+        embeddings = []
+        
+        for graph_idx in range(num_graphs):
+            nodes, edges = self._get_graph_structure(x, edge_index, batch, graph_idx)
+            
+            if filtration == 'degree':
+                values = self._compute_degree_values(len(nodes), edges)
+            elif filtration == 'popularity':
+                values = self._compute_popularity_values(len(nodes), edges)
+            else:
+                raise ValueError(f"Unknown filtration type: {filtration}")
+            
+            sequences = self._get_node_filtration(nodes, edges, values)
+            x_vals, y_vals = zip(*sequences)
+            
+            # numpy 배열을 float32로 변환
+            x_refined, y_refined = self._refine_sequences(
+                np.array(x_vals, dtype=np.float32), 
+                np.array(y_vals, dtype=np.float32)
+            )
+            
+            pivot, growth = self._fit_line(x_refined, y_refined)
+            embeddings.append([pivot, growth])
+            
+        # 최종 결과를 float32 텐서로 변환
+        return torch.tensor(embeddings, dtype=torch.float32, device=device)
+
+
+def TopER_Embedding(data):
+    # TopER 임베딩 계산
+    thresholds = np.linspace(0, 5, 20)  # 논문에서 사용한 값 범위로 조정 필요
+    toper = PyGTopER(thresholds)
+    toper_embeddings = toper.compute_embeddings(data.x, data.edge_index, data.batch)
+    
+    # 데이터에 TopER 임베딩 추가
+    data.toper_embeddings = toper_embeddings
+    return data
 
 
 #%%
@@ -1043,10 +1191,7 @@ class GRAPH_AUTOENCODER(nn.Module):
         
         # 통합된 구조 통계량 예측기
         self.stats_predictor = nn.Sequential(
-            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dims[-1] // 2, 8)  # [degree_stats(4) + cycle_stats(3) + mol_weight(1)]
+            nn.Linear(hidden_dims[-1], 2) 
         )
 
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):

@@ -1,4 +1,8 @@
 #%%
+'''PRESENT'''
+print('이번 BERT 모델 16은 AIDS, BZR, COX2, DHFR에 대한 실험 파일입니다. 마스크 토큰 재구성을 통한 프리-트레인이 이루어집니다. 이후 기존과 같이 노드 특성을 재구성하는 모델을 통해 이상을 탐지합니다. 기존 파일과 다른 점은 성능 평가 결과 비교를 코드 내에서 수행하고자 하였으며, 해당 파일만 실행하면 결과까지 한 번에 볼 수 있도록 하였습니다. 또한, 재구성 오류에 대한 정규화가 이루어져 있습니다. 추가로 훈련 데이터에 대한 산점도와 로그 스케일이 적용되어 있습니다. 그리고 2D density estimation이 적용되어 있습니다. 그리고 분자량, 차수 통계, 고리 통계 등을 맞추는 과정이 반영되어 있습니다. 밀도 기반 이상 스코어')
+
+#%%
 '''IMPORTS'''
 import os
 import re
@@ -15,12 +19,14 @@ import numpy as np
 import gudhi as gd
 import seaborn as sns
 import torch.nn as nn
+import numpy.typing as npt
 import torch.optim as optim
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 import torch_geometric.utils as utils
 
 from torch.nn import init
+from typing import List, Tuple, Dict, Any
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 from torch_geometric.data import Data, Batch
@@ -33,7 +39,7 @@ from torch_geometric.nn import GCNConv, global_mean_pool, global_max_pool, globa
 from sklearn.cluster import KMeans
 from sklearn.decomposition import PCA
 from scipy.spatial.distance import cdist
-from scipy.stats import wasserstein_distance
+from scipy.stats import linregress
 from scipy.spatial.distance import pdist, squareform
 from sklearn.metrics import auc, roc_curve, precision_score, recall_score, f1_score, precision_recall_curve, roc_auc_score, silhouette_score, silhouette_samples
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split, LeaveOneOut
@@ -48,7 +54,7 @@ from scipy.linalg import eigh
 from multiprocessing import Pool
 
 from modules.loss import loss_cal
-from modules.utils import set_seed, set_device, EarlyStopping, get_ad_dataset_Tox21, adj_original, split_batch_graphs, compute_persistence, process_batch_graphs, scott_rule_bandwidth, loocv_bandwidth_selection
+from modules.utils import set_seed, set_device, EarlyStopping, get_ad_split_TU, get_data_loaders_TU, adj_original, split_batch_graphs, compute_persistence, process_batch_graphs, scott_rule_bandwidth, loocv_bandwidth_selection
 
 import networkx as nx
 
@@ -97,11 +103,12 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
     reconstruction_errors = []
     
     for data in train_loader:
-        data = process_batch_graphs(data, dataset_name)
-        recon_optimizer.zero_grad()
+        data = TopER_Embedding(data)
         data = data.to(device)
-        x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
-                
+        recon_optimizer.zero_grad()
+        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        toper_target = data.toper_embeddings
+        
         train_cls_outputs, x_recon, stats_pred = model(x, edge_index, batch, num_graphs)
         
         if epoch % 5 == 0:
@@ -134,9 +141,9 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
             
             start_node = end_node
             
-        stats_loss = persistence_stats_loss(stats_pred, true_stats)
+        stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        alpha_ = 100
+        alpha_ = 10
         stats_loss = alpha_ * stats_loss
         
         loss = node_loss + stats_loss
@@ -182,7 +189,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
 
 
 #%%
-def evaluate_model_with_density(model, test_loader, cluster_centers, epoch, reconstruction_errors, dataset_name, device):
+def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, epoch, trial, reconstruction_errors, device, dataset_name):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
@@ -296,7 +303,7 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, epoch, reco
     ax2.legend()
     
     plt.tight_layout()
-    save_path = f'/home1/rldnjs16/graph_anomaly_detection/density_analysis/{dataset_name}_time_{current_time}/epoch_{epoch}.png'
+    save_path = f'/home1/rldnjs16/graph_anomaly_detection/density_analysis/{dataset_name}_time_{current_time}/epoch_{epoch}_fold_{trial}.png'
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
@@ -317,12 +324,13 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, epoch, reco
     
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
+    bandwidths_results, compare_bandwidths_result = compare_bandwidths(train_data, test_normal, test_anomaly, epoch, trial)
     
-    return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
+    return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data, bandwidths_results, compare_bandwidths_result
 
 
 #%%
-def plot_error_distribution(train_errors, test_errors, epoch, dataset_name, current_time):
+def plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time):
     # 데이터 분리
     train_normal_recon = [e['reconstruction'] for e in train_errors if e['type'] == 'train_normal']
     train_normal_cluster = [e['clustering'] for e in train_errors if e['type'] == 'train_normal']
@@ -361,7 +369,7 @@ def plot_error_distribution(train_errors, test_errors, epoch, dataset_name, curr
     ax2.grid(True)
 
     plt.tight_layout()
-    save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/combined_error_distribution_epoch_{epoch}.png'
+    save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/combined_error_distribution_epoch_{epoch}_fold_{trial}.png'
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
@@ -376,10 +384,175 @@ def plot_error_distribution(train_errors, test_errors, epoch, dataset_name, curr
                         for r, c in zip(test_anomaly_recon, test_anomaly_cluster)]
     }
     
-    json_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/combined_error_distribution_epoch_{epoch}.json'
+    json_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/combined_error_distribution_epoch_{epoch}_fold_{trial}.json'
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     with open(json_path, 'w') as f:
         json.dump(error_data, f)
+
+
+def compare_bandwidths(train_data, test_normal, test_anomaly, epoch, trial, bandwidths=[0.01, 0.05, 0.1, 0.3, 0.7, 0.9]):
+    """
+    다양한 bandwidth 값에 대한 성능 비교 및 10 에폭마다 폴드별 성능 추적
+    """
+    # 10 에폭마다만 계산
+    if epoch % 5 != 0:
+        return None, None
+
+    # 폴드별/에폭별 결과 저장을 위한 전역 딕셔너리 초기화
+    if not hasattr(compare_bandwidths, 'fold_results'):
+        compare_bandwidths.fold_results = {bw: {} for bw in bandwidths}
+        compare_bandwidths.best_epoch_results = {bw: {'auroc': 0, 'epoch': 0} for bw in bandwidths}
+
+    results = {}
+    for bw in bandwidths:
+        # 밀도 추정 및 성능 계산
+        density_scorer = DensityBasedScoring(bandwidth=bw)
+        density_scorer.fit(train_data)
+        
+        normal_scores = density_scorer.score_samples(test_normal)
+        anomaly_scores = density_scorer.score_samples(test_anomaly)
+        
+        y_true = np.concatenate([np.zeros(len(test_normal)), np.ones(len(test_anomaly))])
+        y_scores = np.concatenate([normal_scores, anomaly_scores])
+        fpr, tpr, _ = roc_curve(y_true, y_scores)
+        auroc = auc(fpr, tpr)
+        
+        # 현재 에폭의 폴드 결과 저장
+        if epoch not in compare_bandwidths.fold_results[bw]:
+            compare_bandwidths.fold_results[bw][epoch] = {
+                'aurocs': [],
+                'normal_means': [],
+                'normal_stds': [],
+                'anomaly_means': [],
+                'anomaly_stds': []
+            }
+            
+        compare_bandwidths.fold_results[bw][epoch]['aurocs'].append(auroc)
+        compare_bandwidths.fold_results[bw][epoch]['normal_means'].append(normal_scores.mean())
+        compare_bandwidths.fold_results[bw][epoch]['normal_stds'].append(normal_scores.std())
+        compare_bandwidths.fold_results[bw][epoch]['anomaly_means'].append(anomaly_scores.mean())
+        compare_bandwidths.fold_results[bw][epoch]['anomaly_stds'].append(anomaly_scores.std())
+        
+        # 모든 폴드의 결과가 모였을 때 (5개) 평균 계산 및 최고 성능 업데이트
+        if len(compare_bandwidths.fold_results[bw][epoch]['aurocs']) == 5:
+            mean_auroc = np.mean(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
+            std_auroc = np.std(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
+            
+            if mean_auroc > compare_bandwidths.best_epoch_results[bw]['auroc']:
+                compare_bandwidths.best_epoch_results[bw] = {
+                    'auroc': mean_auroc,
+                    'auroc_std': std_auroc,
+                    'epoch': epoch,
+                    'normal_mean': np.mean(compare_bandwidths.fold_results[bw][epoch]['normal_means']),
+                    'normal_std': np.mean(compare_bandwidths.fold_results[bw][epoch]['normal_stds']),
+                    'anomaly_mean': np.mean(compare_bandwidths.fold_results[bw][epoch]['anomaly_means']),
+                    'anomaly_std': np.mean(compare_bandwidths.fold_results[bw][epoch]['anomaly_stds'])
+                }
+
+        results[bw] = {
+            'auroc': auroc,
+            'normal_mean': normal_scores.mean(),
+            'normal_std': normal_scores.std(),
+            'anomaly_mean': anomaly_scores.mean(),
+            'anomaly_std': anomaly_scores.std()
+        }
+
+    # 마지막 폴드에서 현재 에폭의 평균 성능 출력
+    if trial == 4:  # 마지막 폴드
+        print(f"\nEpoch {epoch} Average Results:")
+        print("-" * 50)
+        for bw in bandwidths:
+            if epoch in compare_bandwidths.fold_results[bw]:
+                mean_auroc = np.mean(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
+                std_auroc = np.std(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
+                print(f"\nBandwidth = {bw}")
+                print(f"Current Mean AUROC: {mean_auroc:.4f} ± {std_auroc:.4f}")
+                print(f"Best Mean AUROC: {compare_bandwidths.best_epoch_results[bw]['auroc']:.4f} "
+                      f"(Epoch {compare_bandwidths.best_epoch_results[bw]['epoch']})")
+
+        # 시각화도 10 에폭마다만 저장
+        plot_density_results(train_data, test_normal, test_anomaly, 
+                           epoch, trial, bandwidths, density_scorer)
+
+    return results, compare_bandwidths.best_epoch_results
+
+
+def print_best_results(best_results):
+    print("\nDetailed Best Results for Each Bandwidth:")
+    print("=" * 80)
+    
+    for bw in best_results.keys():
+        result = best_results[bw]
+        print(f"\nBandwidth = {bw}")
+        print("-" * 40)
+        print(f"Best Epoch: {result['epoch']}")
+        
+        # auroc_std가 있으면 표준편차와 함께 출력, 없으면 auroc만 출력
+        if 'auroc_std' in result:
+            print(f"Mean AUROC: {result['auroc']:.4f} ± {result['auroc_std']:.4f}")
+        else:
+            print(f"AUROC: {result['auroc']:.4f}")
+            
+        # metrics 키가 있는 경우에만 상세 정보 출력
+        if 'metrics' in result:
+            print(f"Normal scores: mean = {result['metrics']['normal_mean']:.4f}, "
+                  f"std = {result['metrics']['normal_std']:.4f}")
+            print(f"Anomaly scores: mean = {result['metrics']['anomaly_mean']:.4f}, "
+                  f"std = {result['metrics']['anomaly_std']:.4f}")
+            
+            # 분리도 계산
+            separation = (result['metrics']['anomaly_mean'] - result['metrics']['normal_mean']) / \
+                        (result['metrics']['normal_std'] + result['metrics']['anomaly_std'])
+            print(f"Score separation: {separation:.4f}")
+        elif 'normal_mean' in result:  # metrics 키가 없고 직접 저장된 경우
+            print(f"Normal scores: mean = {result['normal_mean']:.4f}, "
+                  f"std = {result['normal_std']:.4f}")
+            print(f"Anomaly scores: mean = {result['anomaly_mean']:.4f}, "
+                  f"std = {result['anomaly_std']:.4f}")
+            
+            # 분리도 계산
+            separation = (result['anomaly_mean'] - result['normal_mean']) / \
+                        (result['normal_std'] + result['anomaly_std'])
+            print(f"Score separation: {separation:.4f}")
+    
+    # 최고 성능 bandwidth 찾기
+    best_bw = max(best_results.keys(), key=lambda x: best_results[x]['auroc'])
+    print("\nOverall Best Performance:")
+    print("=" * 40)
+    print(f"Best Bandwidth: {best_bw}")
+    print(f"Epoch: {best_results[best_bw]['epoch']}")
+    if 'auroc_std' in best_results[best_bw]:
+        print(f"Mean AUROC: {best_results[best_bw]['auroc']:.4f} ± {best_results[best_bw]['auroc_std']:.4f}")
+    else:
+        print(f"AUROC: {best_results[best_bw]['auroc']:.4f}")
+
+
+def plot_density_results(train_data, test_normal, test_anomaly, epoch, trial, bandwidths, density_scorer):
+    """시각화 함수 (원래 compare_bandwidths 함수 내의 시각화 부분)"""
+    plt.style.use('seaborn')
+    fig, axes = plt.subplots(2, len(bandwidths), figsize=(20, 10))
+    fig.suptitle('Density Estimation with Different Bandwidths', fontsize=16, y=1.02)
+    
+    for idx, bw in enumerate(bandwidths):
+        # ... (시각화 코드)
+        pass
+    
+    plt.tight_layout()
+    save_path = f'/home1/rldnjs16/graph_anomaly_detection/bandwidth_comparison/{dataset_name}_time_{current_time}/epoch_{epoch}_fold_{trial}.png'
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close()
+            
+
+def scott_rule(X):
+    """
+    Scott's rule for bandwidth selection
+    Similar to Silverman's but with different constant
+    """
+    n = len(X)
+    sigma = np.std(X)
+    # Scott's rule
+    return 1.06 * sigma * np.power(n, -0.2)
 
 
 class DensityBasedScoring:
@@ -485,6 +658,45 @@ class DensityBasedScoring:
         return contour
     
 
+def calculate_graph_statistics(edge_index, num_nodes, graph_node_label):
+    """한 그래프의 통계량 계산 - dtype 일치시킴"""
+    # 1. Degree 통계 - float32로 통일
+    degree = utils.degree(edge_index[0], num_nodes=num_nodes)
+    degree = degree.float()  # float32로 변환
+    
+    degree_stats = torch.tensor([
+        degree.mean(),
+        degree.max(),
+        degree.min(),
+        degree.std()
+    ], dtype=torch.float32, device=edge_index.device)  # 명시적으로 float32 지정
+    
+    # 2. 고리 통계
+    G = nx.Graph()
+    edge_list = edge_index.t().cpu().numpy()
+    G.add_edges_from(edge_list)
+    cycles = nx.cycle_basis(G)
+    cycle_lengths = [len(cycle) for cycle in cycles]
+    
+    if cycle_lengths:
+        avg_cycle = float(np.mean(cycle_lengths))
+        max_cycle = float(max(cycle_lengths))
+    else:
+        avg_cycle = 0.0
+        max_cycle = 0.0
+    
+    cycle_stats = torch.tensor([
+        float(len(cycles)),  # 고리 개수
+        avg_cycle,           # 평균 고리 크기
+        max_cycle           # 최대 고리 크기
+    ], dtype=torch.float32, device=edge_index.device)  # 명시적으로 float32 지정
+    
+    # 3. 분자량
+    mol_weight = graph_node_label.sum().float().unsqueeze(0)  # float32로 변환
+    
+    return torch.cat([degree_stats, cycle_stats, mol_weight])
+
+
 # Loss 함수 정의
 def persistence_stats_loss(pred_stats, true_stats):
     # MSE Loss for continuous values (mean_survival, max_survival, etc.)
@@ -497,10 +709,155 @@ def persistence_stats_loss(pred_stats, true_stats):
 
 
 #%%
+class PyGTopER:
+    def __init__(self, thresholds: List[float]):
+        # thresholds를 float32로 변환
+        self.thresholds = torch.tensor(sorted(thresholds), dtype=torch.float32)
+
+    
+    def _get_graph_structure(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                           batch: torch.Tensor, graph_idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        # 모든 텐서를 float32로 변환
+        x = x.float()  # float32로 명시적 변환
+        
+        # CPU로 이동 및 처리
+        x = x.cpu()
+        edge_index = edge_index.cpu()
+        batch = batch.cpu()
+        
+        mask = batch == graph_idx
+        nodes = x[mask]
+        
+        node_idx = torch.arange(len(batch), dtype=torch.long, device='cpu')[mask]
+        idx_map = {int(old): new for new, old in enumerate(node_idx)}
+        
+        edge_mask = mask[edge_index[0]] & mask[edge_index[1]]
+        graph_edges = edge_index[:, edge_mask]
+        
+        graph_edges = torch.tensor([[idx_map[int(i)] for i in graph_edges[0]],
+                                  [idx_map[int(i)] for i in graph_edges[1]]], 
+                                 dtype=torch.long,  # long 타입 명시
+                                 device='cpu')
+        
+        return nodes, graph_edges
+    
+    def _get_node_filtration(self, nodes: torch.Tensor, edges: torch.Tensor, 
+                            node_values: torch.Tensor) -> List[Tuple[int, int]]:
+        """Compute filtration sequence for a single graph"""
+        sequences = []
+        for threshold in self.thresholds:
+            # Get nodes below threshold
+            mask = node_values <= threshold
+            if not torch.any(mask):
+                sequences.append((0, 0))
+                continue
+                
+            # Get induced edges
+            edge_mask = mask[edges[0]] & mask[edges[1]]
+            filtered_edges = edges[:, edge_mask]
+            
+            sequences.append((torch.sum(mask).item(), 
+                            filtered_edges.shape[1] // 2))
+            
+        return sequences
+
+    def _compute_degree_values(self, num_nodes: int, edges: torch.Tensor) -> torch.Tensor:
+        degrees = torch.zeros(num_nodes, dtype=torch.float32, device='cpu')  # float32 명시
+        unique, counts = torch.unique(edges[0], return_counts=True)
+        degrees[unique] += counts.float()  # counts를 float32로 변환
+        return degrees
+    
+    def _compute_popularity_values(self, num_nodes: int, edges: torch.Tensor) -> torch.Tensor:
+        """Compute popularity values as defined in the paper"""
+        degrees = self._compute_degree_values(num_nodes, edges)
+        
+        popularity = torch.zeros(num_nodes, device='cpu')
+        for i in range(num_nodes):
+            neighbors = edges[1][edges[0] == i]
+            if len(neighbors) > 0:
+                neighbor_degrees = degrees[neighbors]
+                popularity[i] = degrees[i] + neighbor_degrees.mean()
+            else:
+                popularity[i] = degrees[i]
+                
+        return popularity
+    
+    def _refine_sequences(self, x_vals: np.ndarray, y_vals: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+        """Refine sequences according to the paper's methodology"""
+        refined_x = []
+        refined_y = []
+        i = 0
+        while i < len(y_vals):
+            # Find consecutive points with same y value
+            j = i + 1
+            while j < len(y_vals) and y_vals[j] == y_vals[i]:
+                j += 1
+            
+            # Calculate mean of x values
+            x_mean = x_vals[i:j].mean()
+            refined_x.append(x_mean)
+            refined_y.append(y_vals[i])
+            
+            i = j
+            
+        return np.array(refined_x), np.array(refined_y)
+    
+    def _fit_line(self, x: np.ndarray, y: np.ndarray) -> Tuple[float, float]:
+        """Fit line to refined sequences with float32 precision"""
+        if len(x) < 2:
+            return 0.0, 0.0
+            
+        slope, intercept, _, _, _ = linregress(x.astype(np.float32), y.astype(np.float32))
+        return float(intercept), float(slope)  # float32 반환
+
+    def compute_embeddings(self, x: torch.Tensor, edge_index: torch.Tensor, 
+                          batch: torch.Tensor, filtration: str = 'degree') -> torch.Tensor:
+        device = x.device
+        num_graphs = batch.max().item() + 1
+        embeddings = []
+        
+        for graph_idx in range(num_graphs):
+            nodes, edges = self._get_graph_structure(x, edge_index, batch, graph_idx)
+            
+            if filtration == 'degree':
+                values = self._compute_degree_values(len(nodes), edges)
+            elif filtration == 'popularity':
+                values = self._compute_popularity_values(len(nodes), edges)
+            else:
+                raise ValueError(f"Unknown filtration type: {filtration}")
+            
+            sequences = self._get_node_filtration(nodes, edges, values)
+            x_vals, y_vals = zip(*sequences)
+            
+            # numpy 배열을 float32로 변환
+            x_refined, y_refined = self._refine_sequences(
+                np.array(x_vals, dtype=np.float32), 
+                np.array(y_vals, dtype=np.float32)
+            )
+            
+            pivot, growth = self._fit_line(x_refined, y_refined)
+            embeddings.append([pivot, growth])
+            
+        # 최종 결과를 float32 텐서로 변환
+        return torch.tensor(embeddings, dtype=torch.float32, device=device)
+
+    
+def TopER_Embedding(data):
+    # TopER 임베딩 계산
+    thresholds = np.linspace(0, 5, 20)  # 논문에서 사용한 값 범위로 조정 필요
+    toper = PyGTopER(thresholds)
+    toper_embeddings = toper.compute_embeddings(data.x, data.edge_index, data.batch)
+    
+    # 데이터에 TopER 임베딩 추가
+    data.toper_embeddings = toper_embeddings
+    return data
+
+
+#%%
 '''ARGPARSER'''
 parser = argparse.ArgumentParser()
 
-parser.add_argument("--dataset-name", type=str, default='Tox21_p53')
+parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
@@ -698,7 +1055,7 @@ class BilinearEdgeDecoder(nn.Module):
         
         return padded_adj
 
-
+    
 #%%
 class BertEncoder(nn.Module):
     def __init__(self, num_features, hidden_dims, d_model, nhead, num_layers, max_nodes, dropout_rate=0.1):
@@ -848,7 +1205,7 @@ class BertEncoder(nn.Module):
             nn.init.constant_(module.weight, 1)
             nn.init.zeros_(module.bias)
     
-    
+
 #%%
 class BatchUtils:
     @staticmethod
@@ -1010,7 +1367,7 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
     
     return cluster_centers, clustering_metrics
 
-
+            
 #%%
 # GRAPH_AUTOENCODER 클래스 수정
 class GRAPH_AUTOENCODER(nn.Module):
@@ -1043,10 +1400,7 @@ class GRAPH_AUTOENCODER(nn.Module):
         
         # 통합된 구조 통계량 예측기
         self.stats_predictor = nn.Sequential(
-            nn.Linear(hidden_dims[-1], hidden_dims[-1] // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dims[-1] // 2, 8)  # [degree_stats(4) + cycle_stats(3) + mol_weight(1)]
+            nn.Linear(hidden_dims[-1], 2) 
         )
 
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
@@ -1086,7 +1440,7 @@ class GRAPH_AUTOENCODER(nn.Module):
             else:
                 return cls_output, x_recon, masked_outputs
         return cls_output, x_recon, stats_pred
-            
+    
 
 #%%
 '''DATASETS'''
@@ -1095,39 +1449,41 @@ if dataset_name == 'AIDS' or dataset_name == 'NCI1' or dataset_name == 'DHFR':
 else:
     dataset_AN = False
 
-loaders, meta = get_ad_dataset_Tox21(dataset_name, batch_size, test_batch_size)
-
+splits = get_ad_split_TU(dataset_name, n_cross_val)
+loaders, meta = get_data_loaders_TU(dataset_name, batch_size, test_batch_size, splits[0], dataset_AN)
 num_train = meta['num_train']
 num_features = meta['num_feat']
+num_edge_features = meta['num_edge_feat']
 max_nodes = meta['max_nodes']
 
 print(f'Number of graphs: {num_train}')
 print(f'Number of features: {num_features}')
+print(f'Number of edge features: {num_edge_features}')
 print(f'Max nodes: {max_nodes}')
 
 current_time_ = time.localtime()
 current_time = time.strftime("%Y_%m_%d_%H_%M", current_time_)
 print(f'random number saving: {current_time}')
 
-
 # %%
 '''RUN'''
-def run(dataset_name, random_seed, device=device, epoch_results=None):
+def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=None):
     if epoch_results is None:
         epoch_results = {}
     epoch_interval = 10  # 10 에폭 단위로 비교
     
-    set_seed(random_seed)
+    set_seed(random_seed)    
     all_results = []
-
-    loaders, meta = get_ad_dataset_Tox21(dataset_name, batch_size, test_batch_size)
-
+    split=splits[trial]
+    
+    loaders, meta = get_data_loaders_TU(dataset_name, batch_size, test_batch_size, split, dataset_AN)
     num_features = meta['num_feat']
     max_nodes = meta['max_nodes']
-
+    max_node_label = meta['max_node_label']
+    
     # BERT 모델 저장 경로
-    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Tox21/all_pretrained_bert_{dataset_name}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
-                                                                                
+    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
+    
     model = GRAPH_AUTOENCODER(
         num_features=num_features, 
         hidden_dims=hidden_dims, 
@@ -1158,7 +1514,7 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
 
         pretrain_params = list(model.encoder.parameters())
         bert_optimizer = torch.optim.Adam(pretrain_params, lr=learning_rate)
-    
+        
         for epoch in range(1, BERT_epochs+1):
             train_loss, num_sample = train_bert_embedding(
                 model, train_loader, bert_optimizer, device
@@ -1170,16 +1526,15 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
         # 학습된 BERT 저장
         print("Saving pretrained BERT...")
         torch.save(model.encoder.state_dict(), bert_save_path)
-    
+        
     # 2단계: 재구성 학습
     print("\nStage 2: Training reconstruction...")
     recon_optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-        
+    
     for epoch in range(1, epochs+1):
-                
         fold_start = time.time()  # 현재 폴드 시작 시간
         train_loss, num_sample, train_cls_outputs, train_errors = train(model, train_loader, recon_optimizer, device, epoch, dataset_name)
-                
+        
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
         if epoch % log_interval == 0:
@@ -1191,20 +1546,38 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
             print(f"\nClustering Analysis Results (Epoch {epoch}):")
             print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
             print(f"silhouette_score: {clustering_metrics['silhouette_score']:.4f}")
+            
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data, bandwidths_results, compare_bandwidths_result = evaluate_model_with_density(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, epoch, trial, train_errors, device, dataset_name)
+            
+            for bw, metrics in bandwidths_results.items():
+                print(f"\nBandwidth = {bw}")
+                print("-" * 50)
+                print(f"AUROC: {metrics['auroc']:.3f}")
+                print(f"Normal scores:")
+                print(f"  - Mean: {metrics['normal_mean']:.3f}")
+                print(f"  - Std:  {metrics['normal_std']:.3f}")
+                print(f"Anomaly scores:")
+                print(f"  - Mean: {metrics['anomaly_mean']:.3f}")
+                print(f"  - Std:  {metrics['anomaly_std']:.3f}")
                 
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model_with_density(model, test_loader, cluster_centers, epoch, train_errors, dataset_name, device)
+                # 정상과 이상 스코어 간의 분리도 계산
+                separation = (metrics['anomaly_mean'] - metrics['normal_mean']) / \
+                            (metrics['normal_std'] + metrics['anomaly_std'])
+                print(f"Score separation: {separation:.3f}")
+            
+            print_best_results(compare_bandwidths_result)
                 
-            plot_error_distribution(train_errors, test_errors, epoch, dataset_name, current_time)
+            plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time)
 
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
             os.makedirs(os.path.dirname(save_path_), exist_ok=True)
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/'
             os.makedirs(os.path.dirname(save_path_), exist_ok=True)
-                
-            save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/error_distribution_epoch_{epoch}.json'
+            
+            save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/error_distribution_epoch_{epoch}_fold_{trial}.json'
             with open(save_path, 'w') as f:
                 json.dump(visualization_data, f)
-                
+            
             all_results.append((auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly))
             print(f'Epoch {epoch+1}: Training Loss = {train_loss:.4f}, Validation loss = {test_loss:.4f}, Validation loss anomaly = {test_loss_anomaly:.4f}, Validation AUC = {auroc:.4f}, Validation AUPRC = {auprc:.4f}, Precision = {precision:.4f}, Recall = {recall:.4f}, F1 = {f1:.4f}')
             wandb.log({
@@ -1219,7 +1592,7 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
                 "f1": f1,
                 "learning_rate": recon_optimizer.param_groups[0]['lr']
             })
-                
+            
             info_test = 'AD_AUC:{:.4f}, AD_AUPRC:{:.4f}, Test_Loss:{:.4f}, Test_Loss_Anomaly:{:.4f}'.format(auroc, auprc, test_loss, test_loss_anomaly)
             print(info_train + '   ' + info_test)
 
@@ -1227,7 +1600,7 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
             if epoch % epoch_interval == 0:
                 if epoch not in epoch_results:
                     epoch_results[epoch] = {'aurocs': [], 'auprcs': [], 'precisions': [], 'recalls': [], 'f1s': []}
-                    
+                
                 epoch_results[epoch]['aurocs'].append(auroc)
                 epoch_results[epoch]['auprcs'].append(auprc)
                 epoch_results[epoch]['precisions'].append(precision)
@@ -1236,15 +1609,27 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
 
     return auroc, epoch_results
 
+
 #%%
 '''MAIN'''
 if __name__ == '__main__':
     ad_aucs = []
+    fold_times = []
     epoch_results = {}  # 모든 폴드의 에폭별 결과를 저장
-    
+    splits = get_ad_split_TU(dataset_name, n_cross_val)    
     start_time = time.time()  # 전체 실행 시작 시간
-    print(f"Starting seed {random_seed}")
-    ad_auc, epoch_results = run(dataset_name, random_seed, device=device)
+
+    for trial in range(n_cross_val):
+        fold_start = time.time()  # 현재 폴드 시작 시간
+        print(f"Starting fold {trial + 1}/{n_cross_val}")
+        ad_auc, epoch_results = run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_results=epoch_results)
+        ad_aucs.append(ad_auc)
+        
+        fold_end = time.time()  # 현재 폴드 종료 시간   
+        fold_duration = fold_end - fold_start  # 현재 폴드 실행 시간
+        fold_times.append(fold_duration)
+        
+        print(f"Fold {trial + 1} finished in {fold_duration:.2f} seconds.")
     
     # 각 에폭별 평균 성능 계산
     epoch_means = {}
@@ -1279,8 +1664,10 @@ if __name__ == '__main__':
     print(f"F1 = {epoch_means[best_epoch]['f1']:.4f} ± {epoch_stds[best_epoch]['f1']:.4f}")
     
     # 최종 결과 저장
+    total_time = time.time() - start_time
     results = 'AUC: {:.2f}+-{:.2f}'.format(np.mean(ad_aucs) * 100, np.std(ad_aucs) * 100)
     print('[FINAL RESULTS] ' + results)
+    print(f"Total execution time: {total_time:.2f} seconds")
     
     # 모든 결과를 JSON으로 저장
     results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9_2.json'
@@ -1294,7 +1681,5 @@ if __name__ == '__main__':
             'final_auroc_std': float(np.std(ad_aucs))
         }, f, indent=4)
 
-    print('[FINAL RESULTS] ' + str(ad_auc))
-    
 
 wandb.finish()

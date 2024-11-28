@@ -1260,7 +1260,7 @@ def split_batch_graphs(data):
     return graphs
 
 
-def compute_persistence(graph_distance_matrix):
+def compute_persistence(graph_distance_matrix, dataset_name):
     """Persistence diagram만 계산하는 최적화된 함수"""
     try:
         if not isinstance(graph_distance_matrix, np.ndarray) or graph_distance_matrix.size == 0:
@@ -1273,9 +1273,14 @@ def compute_persistence(graph_distance_matrix):
             indices = np.arange(0, graph_distance_matrix.shape[0], step)[:100]
             graph_distance_matrix = graph_distance_matrix[indices][:, indices]
         
+        if dataset_name == 'AIDS':
+            max_dimension = 1
+        else:
+            max_dimension = 2
+            
         # 최소한의 차원과 계산만 수행
         rips = gd.RipsComplex(distance_matrix=graph_distance_matrix)
-        st = rips.create_simplex_tree(max_dimension=1)  # 1차원까지만 계산
+        st = rips.create_simplex_tree(max_dimension=max_dimension) 
         st.persistence()  # 결과 저장 없이 바로 반환
         persistence = [(dim, (birth, death)) for dim, (birth, death) in st.persistence() 
                       if death != float('inf')]  # 무한대 값 필터링
@@ -1288,7 +1293,7 @@ def compute_persistence(graph_distance_matrix):
         return []
     
 
-def process_batch_graphs(data):
+def process_batch_graphs(data, dataset_name):
     try:
         graphs = split_batch_graphs(data)
         stats_list = []
@@ -1297,7 +1302,7 @@ def process_batch_graphs(data):
             try:
                 x_np = x.cpu().detach().numpy()
                 distance_matrix = squareform(pdist(x_np))
-                persistence = compute_persistence(distance_matrix)
+                persistence = compute_persistence(distance_matrix, dataset_name)
                 
                 if not persistence:
                     stats_list.append(np.zeros(5, dtype=np.float32))
