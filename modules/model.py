@@ -714,4 +714,4 @@ class GRAPH_AUTOENCODER2(torch.nn.Module):
             nn.init.constant_(module.weight, 1)
             nn.init.constant_(module.bias, 0)            
             
-            
+

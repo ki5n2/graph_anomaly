@@ -3,7 +3,10 @@
 # python argparse source for experiments
 experiments=(
 "--random-seed 1 --epochs 150 --n-cluster 1 --learning-rate 0.0001"
+"--dataset-name BZR --random-seed 1 --epochs 500 --n-cluster 1 --learning-rate 0.0001"
+"--dataset-name DHFR --random-seed 1 --epochs 150 --n-cluster 1 --learning-rate 0.0001"
 "--dataset-name AIDS --random-seed 1 --epochs 100 --n-cluster 1 --learning-rate 0.0001"
+"--dataset-name NCI1 --random-seed 1 --epochs 200 --n-cluster 1 --learning-rate 0.0001"
 )
 
 # default prefix of job name

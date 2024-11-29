@@ -139,8 +139,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
             
         stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        alpha_ = 10
-        stats_loss = alpha_ * stats_loss
+        stats_loss = beta * stats_loss
         
         loss = node_loss + stats_loss
         
@@ -676,7 +675,7 @@ parser.add_argument("--weight-decay", type=float, default=0.0001)
 parser.add_argument("--learning-rate", type=float, default=0.0001)
 
 parser.add_argument("--alpha", type=float, default=1.0)
-parser.add_argument("--beta", type=float, default=0.05)
+parser.add_argument("--beta", type=float, default=10.0)
 parser.add_argument("--gamma", type=float, default=0.1)
 parser.add_argument("--gamma-cluster", type=float, default=0.5)
 parser.add_argument("--node-theta", type=float, default=0.03)

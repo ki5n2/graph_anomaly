@@ -84,6 +84,7 @@ def train_bert_embedding(model, train_loader, bert_optimizer, device):
         )
         
         mask_loss = torch.norm(masked_outputs - x[mask_indices], p='fro')**2 / mask_indices.sum()
+        
         loss = mask_loss
         print(f'mask_node_feature:{mask_loss}')
         
@@ -143,8 +144,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
             
         stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        alpha_ = 10
-        stats_loss = alpha_ * stats_loss
+        stats_loss = beta * stats_loss
         
         loss = node_loss + stats_loss
         
@@ -885,7 +885,7 @@ parser.add_argument("--weight-decay", type=float, default=0.0001)
 parser.add_argument("--learning-rate", type=float, default=0.0001)
 
 parser.add_argument("--alpha", type=float, default=1.0)
-parser.add_argument("--beta", type=float, default=0.05)
+parser.add_argument("--beta", type=float, default=10.0)
 parser.add_argument("--gamma", type=float, default=0.1)
 parser.add_argument("--gamma-cluster", type=float, default=0.5)
 parser.add_argument("--node-theta", type=float, default=0.03)
@@ -1060,14 +1060,23 @@ class BilinearEdgeDecoder(nn.Module):
 class BertEncoder(nn.Module):
     def __init__(self, num_features, hidden_dims, d_model, nhead, num_layers, max_nodes, dropout_rate=0.1):
         super().__init__()
-        self.gcn_encoder = Encoder(num_features, hidden_dims, dropout_rate)
+        self.gcn_encoder = Encoder(num_features, hidden_dims, dropout_rate=0.0)
+        # 노드 특성 -> 임베딩 공간으로의 직접 프로젝션
+        self.feature_proj = nn.Linear(num_features, hidden_dims[-1])
+        
         self.positional_encoding = GraphBertPositionalEncoding(hidden_dims[-1], max_nodes)
         encoder_layer = nn.TransformerEncoderLayer(
             hidden_dims[-1], nhead, hidden_dims[-1] * 4, dropout_rate, activation='gelu', batch_first = True
         )
         self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
         self.mask_token = nn.Parameter(torch.randn(1, hidden_dims[-1]))
-        self.predicter = nn.Linear(hidden_dims[-1], num_features)
+        # self.predicter = nn.Linear(hidden_dims[-1], num_features)
+        # 임베딩 -> 원본 특성으로의 디코딩
+        self.predicter = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
+            nn.GELU(),
+            nn.Linear(hidden_dims[-1], num_features)
+        )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
         self.edge_decoder = BilinearEdgeDecoder(max_nodes)
         
@@ -1079,8 +1088,14 @@ class BertEncoder(nn.Module):
         self.apply(self._init_weights)
 
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
-        h = self.gcn_encoder(x, edge_index)
+        z_struct = self.gcn_encoder(x, edge_index)
         
+        # 2. 노드 특성의 직접 프로젝션
+        z_feat = self.feature_proj(x)
+
+        # 3. 두 임베딩 결합
+        h = z_struct + z_feat
+
         # 배치 처리
         z_list, edge_index_list, max_nodes_in_batch = BatchUtils.process_batch(h, edge_index, batch)
         
@@ -1482,7 +1497,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     max_node_label = meta['max_node_label']
     
     # BERT 모델 저장 경로
-    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9.pth'
+    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_try10.pth'
     
     model = GRAPH_AUTOENCODER(
         num_features=num_features, 
