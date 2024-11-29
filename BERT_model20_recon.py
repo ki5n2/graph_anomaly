@@ -1,6 +1,6 @@
 #%%
 '''PRESENT'''
-print('이번 BERT 모델 16은 AIDS, BZR, COX2, DHFR에 대한 실험 파일입니다. 마스크 토큰 재구성을 통한 프리-트레인이 이루어집니다. 이후 기존과 같이 노드 특성을 재구성하는 모델을 통해 이상을 탐지합니다. 기존 파일과 다른 점은 성능 평가 결과 비교를 코드 내에서 수행하고자 하였으며, 해당 파일만 실행하면 결과까지 한 번에 볼 수 있도록 하였습니다. 또한, 재구성 오류에 대한 정규화가 이루어져 있습니다. 추가로 훈련 데이터에 대한 산점도와 로그 스케일이 적용되어 있습니다. 그리고 2D density estimation이 적용되어 있습니다. 그리고 분자량, 차수 통계, 고리 통계 등을 맞추는 과정이 반영되어 있습니다. 밀도 기반 이상 스코어')
+print('이번 BERT 모델 19은 AIDS, BZR, COX2, DHFR에 대한 실험 파일입니다. 마스크 토큰 재구성을 통한 프리-트레인이 이루어집니다. 이후 기존과 같이 노드 특성을 재구성하는 모델을 통해 이상을 탐지합니다. 기존 파일과 다른 점은 성능 평가 결과 비교를 코드 내에서 수행하고자 하였으며, 해당 파일만 실행하면 결과까지 한 번에 볼 수 있도록 하였습니다. 또한, 재구성 오류에 대한 정규화가 이루어져 있습니다. 추가로 훈련 데이터에 대한 산점도와 로그 스케일이 적용되어 있습니다. 그리고 2D density estimation이 적용되어 있습니다. 그리고 TopER 과정이 반영되어 있습니다. 밀도 기반 이상 스코어. 프리트레인 과정이 변경되었습니다.')
 
 #%%
 '''IMPORTS'''
@@ -65,39 +65,75 @@ gc.collect()
 
 #%%
 '''TRAIN BERT'''
-def train_bert_embedding(model, train_loader, bert_optimizer, device):
+def pretrain_graph_bert(model, train_loader, optimizer, device):
+    """Graph-BERT pre-training with node reconstruction and structure recovery"""
     model.train()
-    total_loss = 0
-    num_sample = 0
+    total_recon_loss = 0
+    total_struct_loss = 0
+    num_samples = 0
     
     for data in train_loader:
-        bert_optimizer.zero_grad()
         data = data.to(device)
-        x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
+        optimizer.zero_grad()
         
-        # 마스크 생성
-        mask_indices = torch.rand(x.size(0), device=device) < 0.15  # 15% 노드 마스킹
+        # 15% 노드를 마스킹
+        mask_indices = torch.rand(data.x.size(0), device=device) < 0.15
         
-        # BERT 인코딩 및 마스크 토큰 예측만 수행
-        _, _, masked_outputs = model(
-            x, edge_index, batch, num_graphs, mask_indices, training=True, edge_training=False
+        # Forward pass - pre-training mode
+        transformed, masked_outputs, structure_outputs = model(
+            data.x, data.edge_index, data.batch, data.num_graphs,
+            mask_indices=mask_indices, is_pretrain=True
         )
         
-        mask_loss = torch.norm(masked_outputs - x[mask_indices], p='fro')**2 / mask_indices.sum()
+        # Node reconstruction loss
+        if masked_outputs is not None and mask_indices.sum() > 0:
+            masked_features = data.x[mask_indices]
+            recon_loss = F.mse_loss(
+                masked_outputs,
+                masked_features,
+                reduction='mean'
+            )
+        else:
+            recon_loss = torch.tensor(0.0, device=device)
+            
+        # Structure recovery loss
+        intimacy_scores = []
+        start_idx = 0
+        for i in range(data.num_graphs):
+            mask = (data.batch == i)
+            num_nodes = mask.sum().item()
+            graph_edge_index = data.edge_index[:, (data.edge_index[0] >= start_idx) & 
+                                               (data.edge_index[0] < start_idx + num_nodes)]
+            graph_edge_index = graph_edge_index - start_idx
+            
+            intimacy_matrix = model.encoder.compute_intimacy_matrix(
+                graph_edge_index, num_nodes
+            )
+            intimacy_scores.append(intimacy_matrix)
+            start_idx += num_nodes
+            
+        intimacy_target = torch.block_diag(*intimacy_scores)
+        struct_loss = F.mse_loss(
+            structure_outputs @ structure_outputs.t(),
+            intimacy_target,
+            reduction='mean'
+        )
         
-        loss = mask_loss
-        print(f'mask_node_feature:{mask_loss}')
+        print(f'recon_loss: {recon_loss}')
+        print(f'struct_loss: {struct_loss}')
         
+        loss = recon_loss + struct_loss
         loss.backward()
-        bert_optimizer.step()
-        total_loss += loss.item()
-        num_sample += num_graphs
-    
-    return total_loss / len(train_loader), num_sample
+        optimizer.step()
+        
+        total_recon_loss += recon_loss.item() * data.num_graphs
+        total_struct_loss += struct_loss.item() * data.num_graphs
+        num_samples += data.num_graphs
+        
+    return (total_recon_loss + total_struct_loss) / num_samples, num_samples
 
 
-#%%
-def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
+def train(model, train_loader, recon_optimizer, device, epoch):
     model.train()
     total_loss = 0
     num_sample = 0
@@ -110,7 +146,11 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
         toper_target = data.toper_embeddings
         
-        train_cls_outputs, x_recon, stats_pred = model(x, edge_index, batch, num_graphs)
+        # Forward pass - fine-tuning mode
+        train_cls_outputs, x_recon, stats_pred = model(
+            x, edge_index, batch, num_graphs,
+            is_pretrain=False
+        )
         
         if epoch % 5 == 0:
             cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
@@ -144,8 +184,9 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
             
         stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        stats_loss = beta * stats_loss
-        
+        alpha_ = 10
+        stats_loss = alpha_ * stats_loss
+
         loss = node_loss + stats_loss
         
         print(f'node_loss: {node_loss}')
@@ -156,54 +197,29 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
         recon_optimizer.step()
         total_loss += loss.item()
 
-    if epoch % 5 == 0:
-        # Create figure with two subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
-        
-        recon_errors = [point['reconstruction'] for point in reconstruction_errors]
-        cluster_errors = [point['clustering'] for point in reconstruction_errors]
-        
-        # Normal scale plot
-        ax1.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
-        ax1.set_xlabel('Reconstruction Error (node_loss * alpha)')
-        ax1.set_ylabel('Clustering Distance (min_distance * gamma)')
-        ax1.set_title(f'Training Error Distribution (Epoch {epoch})')
-        ax1.grid(True)
-
-        # Log scale plot
-        ax2.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
-        ax2.set_xlabel('Reconstruction Error (node_loss * alpha)')
-        ax2.set_ylabel('Clustering Distance (min_distance * gamma)')
-        ax2.set_title(f'Training Error Distribution - Log Scale (Epoch {epoch})')
-        ax2.set_xscale('log')
-        ax2.set_yscale('log')
-        ax2.grid(True)
-
-        plt.tight_layout()
-        save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/train_error_distribution_epoch_{epoch}.png'
-        os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path)
-        plt.close()
-
     return total_loss / len(train_loader), num_sample, train_cls_outputs.detach().cpu(), reconstruction_errors
 
 
 #%%
-def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, epoch, trial, reconstruction_errors, device, dataset_name):
+def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, reconstruction_errors, epoch, device):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
     all_labels = []
     all_scores = []
-    reconstruction_errors_test = []
+    reconstruction_errors_test = []  # 새로 추가
     
     with torch.no_grad():
         for data in test_loader:
             data = data.to(device)
-            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-            e_cls_output, x_recon, stats_pred = model(x, edge_index, batch, num_graphs)
+            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs 
+            # Forward pass - evaluation mode
+            e_cls_output, x_recon, stats_pred = model(
+                x, edge_index, batch, num_graphs,
+                is_pretrain=False
+            )
             
-            e_cls_outputs_np = e_cls_output.detach().cpu().numpy()
+            e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
             
             recon_errors = []
             start_node = 0
@@ -211,27 +227,27 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
                 num_nodes = (batch == i).sum().item()
                 end_node = start_node + num_nodes
                 
-                # 재구성 오차 계산
+                # Reconstruction error 계산
                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
                 node_loss = node_loss.item() * alpha
                 
-                # 클러스터링 거리 계산
                 cls_vec = e_cls_outputs_np[i].reshape(1, -1)
                 distances = cdist(cls_vec, cluster_centers, metric='euclidean')
                 min_distance = distances.min().item() * gamma
                 
+                # 변환된 값들 저장
                 reconstruction_errors_test.append({
                     'reconstruction': node_loss,
                     'clustering': min_distance,
                     'type': 'test_normal' if data.y[i].item() == 0 else 'test_anomaly'
                 })
-                
+
                 # 전체 에러는 변환된 값들의 평균으로 계산
                 recon_error = node_loss + min_distance              
                 recon_errors.append(recon_error)
                 
                 print(f'test_node_loss: {node_loss}')
-                print(f'test_structure_loss: {min_distance}')
+                print(f'test_min_distance: {min_distance}')
                 
                 if data.y[i].item() == 0:
                     total_loss_ += recon_error
@@ -240,33 +256,26 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
                     
                 start_node = end_node
             
+            all_scores.extend(recon_errors)
             all_labels.extend(data.y.cpu().numpy())
-            
-
-    # 데이터 분리 및 특징 벡터 구성
-    train_data = np.array([[error['reconstruction'], error['clustering']] 
-                          for error in reconstruction_errors if error['type'] == 'train_normal'])
-    test_normal = np.array([[error['reconstruction'], error['clustering']] 
-                           for error in reconstruction_errors_test if error['type'] == 'test_normal'])
-    test_anomaly = np.array([[error['reconstruction'], error['clustering']] 
-                            for error in reconstruction_errors_test if error['type'] == 'test_anomaly'])
     
-    # 밀도 기반 스코어링 적용
-    # # Scott의 규칙 적용
-    # bandwidth = scott_rule_bandwidth(train_data)
-    bandwidth, _ = loocv_bandwidth_selection(train_data)
-    print(f'bandwidth : {bandwidth}')
-    # LOOCV 적용
-    density_scorer = DensityBasedScoring(bandwidth=bandwidth)
-    density_scorer.fit(train_data)
+    # 시각화를 위한 데이터 변환
+    visualization_data = {
+        'normal': [
+            {'reconstruction': error['reconstruction'], 
+             'clustering': error['clustering']}
+            for error in reconstruction_errors_test if error['type'] == 'test_normal'
+        ],
+        'anomaly': [
+            {'reconstruction': error['reconstruction'], 
+             'clustering': error['clustering']}
+            for error in reconstruction_errors_test if error['type'] == 'test_anomaly'
+        ]
+    }
     
-    # 이상 스코어 계산
-    normal_scores = density_scorer.score_samples(test_normal)
-    anomaly_scores = density_scorer.score_samples(test_anomaly)
-    
-    # 전체 스코어 및 라벨 구성
-    all_scores = np.concatenate([normal_scores, anomaly_scores])
-    all_labels = np.array([0] * len(normal_scores) + [1] * len(anomaly_scores))
+    # 메트릭 계산
+    all_labels = np.array(all_labels)
+    all_scores = np.array(all_scores)
     
     # 성능 메트릭 계산
     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
@@ -283,50 +292,10 @@ def evaluate_model_with_density(model, test_loader, cluster_centers, n_clusters,
     recall = recall_score(all_labels, pred_labels)
     f1 = f1_score(all_labels, pred_labels)
     
-    # 시각화
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
-    
-    # 원본 산점도와 밀도 등고선
-    contour = density_scorer.plot_density_contours(train_data, test_normal, test_anomaly, ax1)
-    fig.colorbar(contour, ax=ax1)
-    ax1.set_xlabel('Reconstruction Error')
-    ax1.set_ylabel('Clustering Distance')
-    ax1.set_title('Density-based Anomaly Detection')
-    ax1.legend()
-    
-    # 이상 스코어 분포
-    ax2.hist(normal_scores, bins=50, alpha=0.5, density=True, label='Normal', color='green')
-    ax2.hist(anomaly_scores, bins=50, alpha=0.5, density=True, label='Anomaly', color='red')
-    ax2.set_xlabel('Anomaly Score (-log density)')
-    ax2.set_ylabel('Density')
-    ax2.set_title('Distribution of Anomaly Scores')
-    ax2.legend()
-    
-    plt.tight_layout()
-    save_path = f'/home1/rldnjs16/graph_anomaly_detection/density_analysis/{dataset_name}_time_{current_time}/epoch_{epoch}_fold_{trial}.png'
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path)
-    plt.close()
-    
-    # 시각화를 위한 데이터 변환
-    visualization_data = {
-        'normal': [
-            {'reconstruction': error['reconstruction'], 
-             'clustering': error['clustering']}
-            for error in reconstruction_errors_test if error['type'] == 'test_normal'
-        ],
-        'anomaly': [
-            {'reconstruction': error['reconstruction'], 
-             'clustering': error['clustering']}
-            for error in reconstruction_errors_test if error['type'] == 'test_anomaly'
-        ]
-    }
-    
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
-    bandwidths_results, compare_bandwidths_result = compare_bandwidths(train_data, test_normal, test_anomaly, epoch, trial)
     
-    return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data, bandwidths_results, compare_bandwidths_result
+    return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
 
 
 #%%
@@ -388,171 +357,6 @@ def plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_nam
     os.makedirs(os.path.dirname(json_path), exist_ok=True)
     with open(json_path, 'w') as f:
         json.dump(error_data, f)
-
-
-def compare_bandwidths(train_data, test_normal, test_anomaly, epoch, trial, bandwidths=[0.01, 0.05, 0.1, 0.3, 0.7, 0.9]):
-    """
-    다양한 bandwidth 값에 대한 성능 비교 및 10 에폭마다 폴드별 성능 추적
-    """
-    # 10 에폭마다만 계산
-    if epoch % 5 != 0:
-        return None, None
-
-    # 폴드별/에폭별 결과 저장을 위한 전역 딕셔너리 초기화
-    if not hasattr(compare_bandwidths, 'fold_results'):
-        compare_bandwidths.fold_results = {bw: {} for bw in bandwidths}
-        compare_bandwidths.best_epoch_results = {bw: {'auroc': 0, 'epoch': 0} for bw in bandwidths}
-
-    results = {}
-    for bw in bandwidths:
-        # 밀도 추정 및 성능 계산
-        density_scorer = DensityBasedScoring(bandwidth=bw)
-        density_scorer.fit(train_data)
-        
-        normal_scores = density_scorer.score_samples(test_normal)
-        anomaly_scores = density_scorer.score_samples(test_anomaly)
-        
-        y_true = np.concatenate([np.zeros(len(test_normal)), np.ones(len(test_anomaly))])
-        y_scores = np.concatenate([normal_scores, anomaly_scores])
-        fpr, tpr, _ = roc_curve(y_true, y_scores)
-        auroc = auc(fpr, tpr)
-        
-        # 현재 에폭의 폴드 결과 저장
-        if epoch not in compare_bandwidths.fold_results[bw]:
-            compare_bandwidths.fold_results[bw][epoch] = {
-                'aurocs': [],
-                'normal_means': [],
-                'normal_stds': [],
-                'anomaly_means': [],
-                'anomaly_stds': []
-            }
-            
-        compare_bandwidths.fold_results[bw][epoch]['aurocs'].append(auroc)
-        compare_bandwidths.fold_results[bw][epoch]['normal_means'].append(normal_scores.mean())
-        compare_bandwidths.fold_results[bw][epoch]['normal_stds'].append(normal_scores.std())
-        compare_bandwidths.fold_results[bw][epoch]['anomaly_means'].append(anomaly_scores.mean())
-        compare_bandwidths.fold_results[bw][epoch]['anomaly_stds'].append(anomaly_scores.std())
-        
-        # 모든 폴드의 결과가 모였을 때 (5개) 평균 계산 및 최고 성능 업데이트
-        if len(compare_bandwidths.fold_results[bw][epoch]['aurocs']) == 5:
-            mean_auroc = np.mean(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
-            std_auroc = np.std(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
-            
-            if mean_auroc > compare_bandwidths.best_epoch_results[bw]['auroc']:
-                compare_bandwidths.best_epoch_results[bw] = {
-                    'auroc': mean_auroc,
-                    'auroc_std': std_auroc,
-                    'epoch': epoch,
-                    'normal_mean': np.mean(compare_bandwidths.fold_results[bw][epoch]['normal_means']),
-                    'normal_std': np.mean(compare_bandwidths.fold_results[bw][epoch]['normal_stds']),
-                    'anomaly_mean': np.mean(compare_bandwidths.fold_results[bw][epoch]['anomaly_means']),
-                    'anomaly_std': np.mean(compare_bandwidths.fold_results[bw][epoch]['anomaly_stds'])
-                }
-
-        results[bw] = {
-            'auroc': auroc,
-            'normal_mean': normal_scores.mean(),
-            'normal_std': normal_scores.std(),
-            'anomaly_mean': anomaly_scores.mean(),
-            'anomaly_std': anomaly_scores.std()
-        }
-
-    # 마지막 폴드에서 현재 에폭의 평균 성능 출력
-    if trial == 4:  # 마지막 폴드
-        print(f"\nEpoch {epoch} Average Results:")
-        print("-" * 50)
-        for bw in bandwidths:
-            if epoch in compare_bandwidths.fold_results[bw]:
-                mean_auroc = np.mean(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
-                std_auroc = np.std(compare_bandwidths.fold_results[bw][epoch]['aurocs'])
-                print(f"\nBandwidth = {bw}")
-                print(f"Current Mean AUROC: {mean_auroc:.4f} ± {std_auroc:.4f}")
-                print(f"Best Mean AUROC: {compare_bandwidths.best_epoch_results[bw]['auroc']:.4f} "
-                      f"(Epoch {compare_bandwidths.best_epoch_results[bw]['epoch']})")
-
-        # 시각화도 10 에폭마다만 저장
-        plot_density_results(train_data, test_normal, test_anomaly, 
-                           epoch, trial, bandwidths, density_scorer)
-
-    return results, compare_bandwidths.best_epoch_results
-
-
-def print_best_results(best_results):
-    print("\nDetailed Best Results for Each Bandwidth:")
-    print("=" * 80)
-    
-    for bw in best_results.keys():
-        result = best_results[bw]
-        print(f"\nBandwidth = {bw}")
-        print("-" * 40)
-        print(f"Best Epoch: {result['epoch']}")
-        
-        # auroc_std가 있으면 표준편차와 함께 출력, 없으면 auroc만 출력
-        if 'auroc_std' in result:
-            print(f"Mean AUROC: {result['auroc']:.4f} ± {result['auroc_std']:.4f}")
-        else:
-            print(f"AUROC: {result['auroc']:.4f}")
-            
-        # metrics 키가 있는 경우에만 상세 정보 출력
-        if 'metrics' in result:
-            print(f"Normal scores: mean = {result['metrics']['normal_mean']:.4f}, "
-                  f"std = {result['metrics']['normal_std']:.4f}")
-            print(f"Anomaly scores: mean = {result['metrics']['anomaly_mean']:.4f}, "
-                  f"std = {result['metrics']['anomaly_std']:.4f}")
-            
-            # 분리도 계산
-            separation = (result['metrics']['anomaly_mean'] - result['metrics']['normal_mean']) / \
-                        (result['metrics']['normal_std'] + result['metrics']['anomaly_std'])
-            print(f"Score separation: {separation:.4f}")
-        elif 'normal_mean' in result:  # metrics 키가 없고 직접 저장된 경우
-            print(f"Normal scores: mean = {result['normal_mean']:.4f}, "
-                  f"std = {result['normal_std']:.4f}")
-            print(f"Anomaly scores: mean = {result['anomaly_mean']:.4f}, "
-                  f"std = {result['anomaly_std']:.4f}")
-            
-            # 분리도 계산
-            separation = (result['anomaly_mean'] - result['normal_mean']) / \
-                        (result['normal_std'] + result['anomaly_std'])
-            print(f"Score separation: {separation:.4f}")
-    
-    # 최고 성능 bandwidth 찾기
-    best_bw = max(best_results.keys(), key=lambda x: best_results[x]['auroc'])
-    print("\nOverall Best Performance:")
-    print("=" * 40)
-    print(f"Best Bandwidth: {best_bw}")
-    print(f"Epoch: {best_results[best_bw]['epoch']}")
-    if 'auroc_std' in best_results[best_bw]:
-        print(f"Mean AUROC: {best_results[best_bw]['auroc']:.4f} ± {best_results[best_bw]['auroc_std']:.4f}")
-    else:
-        print(f"AUROC: {best_results[best_bw]['auroc']:.4f}")
-
-
-def plot_density_results(train_data, test_normal, test_anomaly, epoch, trial, bandwidths, density_scorer):
-    """시각화 함수 (원래 compare_bandwidths 함수 내의 시각화 부분)"""
-    plt.style.use('seaborn')
-    fig, axes = plt.subplots(2, len(bandwidths), figsize=(20, 10))
-    fig.suptitle('Density Estimation with Different Bandwidths', fontsize=16, y=1.02)
-    
-    for idx, bw in enumerate(bandwidths):
-        # ... (시각화 코드)
-        pass
-    
-    plt.tight_layout()
-    save_path = f'/home1/rldnjs16/graph_anomaly_detection/bandwidth_comparison/{dataset_name}_time_{current_time}/epoch_{epoch}_fold_{trial}.png'
-    os.makedirs(os.path.dirname(save_path), exist_ok=True)
-    plt.savefig(save_path, dpi=300, bbox_inches='tight')
-    plt.close()
-            
-
-def scott_rule(X):
-    """
-    Scott's rule for bandwidth selection
-    Similar to Silverman's but with different constant
-    """
-    n = len(X)
-    sigma = np.std(X)
-    # Scott's rule
-    return 1.06 * sigma * np.power(n, -0.2)
 
 
 class DensityBasedScoring:
@@ -656,54 +460,11 @@ class DensityBasedScoring:
         ax.tick_params(labelsize=10)
         
         return contour
-    
-
-def calculate_graph_statistics(edge_index, num_nodes, graph_node_label):
-    """한 그래프의 통계량 계산 - dtype 일치시킴"""
-    # 1. Degree 통계 - float32로 통일
-    degree = utils.degree(edge_index[0], num_nodes=num_nodes)
-    degree = degree.float()  # float32로 변환
-    
-    degree_stats = torch.tensor([
-        degree.mean(),
-        degree.max(),
-        degree.min(),
-        degree.std()
-    ], dtype=torch.float32, device=edge_index.device)  # 명시적으로 float32 지정
-    
-    # 2. 고리 통계
-    G = nx.Graph()
-    edge_list = edge_index.t().cpu().numpy()
-    G.add_edges_from(edge_list)
-    cycles = nx.cycle_basis(G)
-    cycle_lengths = [len(cycle) for cycle in cycles]
-    
-    if cycle_lengths:
-        avg_cycle = float(np.mean(cycle_lengths))
-        max_cycle = float(max(cycle_lengths))
-    else:
-        avg_cycle = 0.0
-        max_cycle = 0.0
-    
-    cycle_stats = torch.tensor([
-        float(len(cycles)),  # 고리 개수
-        avg_cycle,           # 평균 고리 크기
-        max_cycle           # 최대 고리 크기
-    ], dtype=torch.float32, device=edge_index.device)  # 명시적으로 float32 지정
-    
-    # 3. 분자량
-    mol_weight = graph_node_label.sum().float().unsqueeze(0)  # float32로 변환
-    
-    return torch.cat([degree_stats, cycle_stats, mol_weight])
 
 
 # Loss 함수 정의
 def persistence_stats_loss(pred_stats, true_stats):
-    # MSE Loss for continuous values (mean_survival, max_survival, etc.)
-    continuous_loss = F.mse_loss(pred_stats[:, :5], true_stats[:, :5])
-    
-    # Cross Entropy Loss for Betti numbers (if needed)
-    # betti_loss = F.mse_loss(pred_stats[:, 5:], true_stats[:, 5:])
+    continuous_loss = F.mse_loss(pred_stats[:, :2], true_stats[:, :2])
     
     return continuous_loss
 
@@ -885,7 +646,7 @@ parser.add_argument("--weight-decay", type=float, default=0.0001)
 parser.add_argument("--learning-rate", type=float, default=0.0001)
 
 parser.add_argument("--alpha", type=float, default=1.0)
-parser.add_argument("--beta", type=float, default=10.0)
+parser.add_argument("--beta", type=float, default=0.001)
 parser.add_argument("--gamma", type=float, default=0.1)
 parser.add_argument("--gamma-cluster", type=float, default=0.5)
 parser.add_argument("--node-theta", type=float, default=0.03)
@@ -1057,154 +818,255 @@ class BilinearEdgeDecoder(nn.Module):
 
     
 #%%
-class BertEncoder(nn.Module):
+class GraphBertEncoder(nn.Module):
     def __init__(self, num_features, hidden_dims, d_model, nhead, num_layers, max_nodes, dropout_rate=0.1):
         super().__init__()
-        self.gcn_encoder = Encoder(num_features, hidden_dims, dropout_rate)
-        self.positional_encoding = GraphBertPositionalEncoding(hidden_dims[-1], max_nodes)
-        encoder_layer = nn.TransformerEncoderLayer(
-            hidden_dims[-1], nhead, hidden_dims[-1] * 4, dropout_rate, activation='gelu', batch_first = True
-        )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
-        self.mask_token = nn.Parameter(torch.randn(1, hidden_dims[-1]))
-        self.predicter = nn.Linear(hidden_dims[-1], num_features)
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
-        self.edge_decoder = BilinearEdgeDecoder(max_nodes)
+        # 노드 임베딩 컴포넌트
+        self.raw_embeddings = nn.Linear(num_features, hidden_dims[-1])
+        self.wl_embeddings = nn.Embedding(100, hidden_dims[-1])
+        self.pos_embeddings = nn.Embedding(max_nodes, hidden_dims[-1])
+        self.hop_embeddings = nn.Embedding(max_nodes, hidden_dims[-1])
         
+        # 임베딩 정규화
+        self.layer_norm = nn.LayerNorm(hidden_dims[-1])
         self.dropout = nn.Dropout(dropout_rate)
-        self.max_nodes = max_nodes
-        self.d_model = d_model
         
-        # 가중치 초기화
-        self.apply(self._init_weights)
-
-    def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
-        h = self.gcn_encoder(x, edge_index)
-        
-        # 배치 처리
-        z_list, edge_index_list, max_nodes_in_batch = BatchUtils.process_batch(h, edge_index, batch)
-        
-        # 3. 각 그래프에 대해 포지셔널 인코딩 계산
-        pos_encoded_list = []
-        for i, (z_graph, edge_idx) in enumerate(zip(z_list, edge_index_list)):
-            # 포지셔널 인코딩 계산
-            pos_encoding = self.positional_encoding(edge_idx, z_graph.size(0))
-            # 인코딩 적용
-            z_graph_with_pos = z_graph + pos_encoding
-            pos_encoded_list.append(z_graph_with_pos)
-            
-        z_with_cls_batch, padding_mask = BatchUtils.add_cls_token(
-            pos_encoded_list, self.cls_token, max_nodes_in_batch, x.device
-        )
-                
-        # 5. 마스킹 적용
-        if training and mask_indices is not None:
-            mask_positions = torch.zeros_like(padding_mask)
-            start_idx = 0
-            for i in range(len(z_list)):
-                num_nodes = z_list[i].size(0)
-                graph_mask_indices = mask_indices[start_idx:start_idx + num_nodes]
-                mask_positions[i, 1:num_nodes+1] = graph_mask_indices
-                node_indices = mask_positions[i].nonzero().squeeze(-1)
-                # mask_token = mask_token.to(device)
-                z_with_cls_batch[i, node_indices] = self.mask_token
-                padding_mask[i, num_nodes+1:] = True
-                start_idx += num_nodes
-                
-        # Transformer 처리
-        transformed = self.transformer(
-            z_with_cls_batch,
-            src_key_padding_mask=padding_mask
-        )
-        
-        if edge_training == False:
-            node_embeddings, masked_outputs = self._process_outputs(
-                transformed, batch, mask_positions if training and mask_indices is not None else None
+        # Transformer 인코더
+        encoder_layers = []
+        for _ in range(num_layers):
+            layer = nn.ModuleDict({
+                'attention': nn.MultiheadAttention(
+                    hidden_dims[-1], nhead, dropout=dropout_rate, batch_first=True
+                ),
+                'norm1': nn.LayerNorm(hidden_dims[-1]),
+                'norm2': nn.LayerNorm(hidden_dims[-1]),
+                'ffn': nn.Sequential(
+                    nn.Linear(hidden_dims[-1], hidden_dims[-1] * 4),
+                    nn.GELU(),
+                    nn.Dropout(dropout_rate),
+                    nn.Linear(hidden_dims[-1] * 4, hidden_dims[-1])
                 )
-        else:
-            # 결과 추출
-            node_embeddings, _ = self._process_outputs(
-                transformed, batch, mask_positions=None
+            })
+            encoder_layers.append(layer)
+        self.encoder_layers = nn.ModuleList(encoder_layers)
+        
+        # 마스크 토큰과 Graph Residual을 위한 컴포넌트
+        self.mask_token = nn.Parameter(torch.randn(1, hidden_dims[-1]))
+        self.graph_residual = nn.Linear(num_features, hidden_dims[-1])
+        
+        # Pre-training heads
+        self.node_predictor = nn.Linear(hidden_dims[-1], num_features)
+        self.structure_predictor = nn.Sequential(
+            nn.Linear(hidden_dims[-1], hidden_dims[-1]),
+            nn.ReLU(),
+            nn.Linear(hidden_dims[-1], hidden_dims[-1])
+        )
+        
+        self.max_nodes = max_nodes
+        self.hidden_dims = hidden_dims
+        self.alpha = 0.15  # pagerank damping factor
+
+    def compute_wl_roles(self, edge_index, num_nodes, num_iters=3):
+        """Enhanced WL algorithm with better structural feature capture"""
+        edge_index_np = edge_index.cpu().numpy()
+        G = nx.Graph()
+        G.add_nodes_from(range(num_nodes))
+        G.add_edges_from(zip(edge_index_np[0], edge_index_np[1]))
+        
+        # 초기 레이블은 [degree, clustering coefficient, pagerank]
+        initial_labels = {}
+        pagerank = nx.pagerank(G, alpha=0.85)
+        clustering = nx.clustering(G)
+        
+        for node in G.nodes():
+            initial_labels[node] = (
+                G.degree(node),
+                clustering.get(node, 0),
+                int(pagerank.get(node, 0) * 1000)
             )
         
-        if training and edge_training:
-            adj_recon_list = []
-            idx = 0
-            for i in range(num_graphs):
-                num_nodes = z_list[i].size(0)
-                z_graph = node_embeddings[idx:idx + num_nodes]
-                adj_recon = self.edge_decoder(z_graph)
-                adj_recon_list.append(adj_recon)
-                idx += num_nodes
+        labels = initial_labels
+        for _ in range(num_iters):
+            new_labels = {}
+            for node in G.nodes():
+                # 이웃의 레이블 집계
+                neighbor_labels = sorted([labels[n] for n in G.neighbors(node)])
+                if not neighbor_labels:
+                    neighbor_labels = [(0, 0, 0)]
+                
+                # 구조적 특징 업데이트
+                deg_sum = sum(l[0] for l in neighbor_labels)
+                clust_sum = sum(l[1] for l in neighbor_labels)
+                pr_sum = sum(l[2] for l in neighbor_labels)
+                
+                new_label = (
+                    labels[node][0] + deg_sum,
+                    labels[node][1] + clust_sum / (len(neighbor_labels) + 1e-6),
+                    labels[node][2] + pr_sum / (len(neighbor_labels) + 1e-6)
+                )
+                new_labels[node] = new_label
             
-        if training:
-            if edge_training:
-                return node_embeddings, adj_recon_list
+            labels = new_labels
+        
+        # 레이블을 100개의 버킷으로 해싱
+        final_colors = []
+        for node in range(num_nodes):
+            label = labels[node]
+            hash_val = hash(str(label)) % 100
+            final_colors.append(hash_val)
+        
+        return torch.tensor(final_colors, device=edge_index.device)
+
+    def compute_intimacy_matrix(self, edge_index, num_nodes):
+        """Improved intimacy matrix computation using multiple metrics"""
+        # 정규화된 인접 행렬 계산
+        adj = torch.sparse_coo_tensor(
+            edge_index,
+            torch.ones(edge_index.size(1), device=edge_index.device),
+            (num_nodes, num_nodes)
+        ).to_dense()
+        
+        # PageRank 계산
+        deg = adj.sum(dim=1)
+        deg_inv = 1.0 / deg.clamp(min=1.)
+        norm_adj = adj * deg_inv.unsqueeze(1)
+        identity = torch.eye(num_nodes, device=edge_index.device)
+        pagerank = self.alpha * torch.inverse(identity - (1 - self.alpha) * norm_adj)
+        
+        # 구조적 유사도 계산 (Katz 유사도)
+        beta = 0.001  # 감쇠 계수
+        katz = torch.inverse(identity - beta * norm_adj) - identity
+        
+        # 최종 intimacy score는 PageRank와 Katz의 조합
+        intimacy = (pagerank + katz) / 2
+        return F.normalize(intimacy, p=2, dim=1)
+
+    def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False):
+        device = x.device
+        z_list = []
+        subgraphs = []
+        start_idx = 0
+        
+        # Graph residual 계산
+        residual = self.graph_residual(x)  # [total_nodes, hidden_dim]
+        
+        for i in range(num_graphs):
+            # 현재 그래프 추출
+            mask = (batch == i)
+            num_nodes = mask.sum().item()
+            current_x = x[mask]
+            
+            # Linkless subgraph 생성을 위한 context 계산
+            if training:
+                # Pre-training 시에만 edge_index 사용
+                current_edge_index = edge_index[:, (edge_index[0] >= start_idx) & 
+                                               (edge_index[0] < start_idx + num_nodes)]
+                current_edge_index = current_edge_index - start_idx
+                
+                intimacy_matrix = self.compute_intimacy_matrix(current_edge_index, num_nodes)
+                wl_codes = self.compute_wl_roles(current_edge_index, num_nodes)
             else:
-                return node_embeddings, masked_outputs
-
-        return node_embeddings
-
-    def _apply_masking(self, z_with_cls_batch, padding_mask, batch, mask_indices):
-        batch_size = z_with_cls_batch.size(0)
-        mask_positions = torch.zeros_like(padding_mask)
-        start_idx = 0
-        
-        for i in range(batch_size):
-            mask = (batch == i)
-            num_nodes = mask.sum().item()
-            graph_mask_indices = mask_indices[start_idx:start_idx + num_nodes]
-            mask_positions[i, 1:num_nodes+1] = graph_mask_indices
-            node_indices = mask_positions[i].nonzero().squeeze(-1)
-            z_with_cls_batch[i, node_indices] = self.mask_token
-            padding_mask[i, num_nodes+1:] = True
-            start_idx += num_nodes
+                # Fine-tuning과 추론 시에는 attention만 사용
+                intimacy_matrix = torch.eye(num_nodes, device=device)
+                wl_codes = torch.zeros(num_nodes, device=device)
             
-        return mask_positions
-
-    def _process_outputs(self, transformed, batch, mask_positions=None):
-        node_embeddings = []
-        masked_outputs = []
-        batch_size = transformed.size(0)
-        start_idx = 0
-        
-        for i in range(batch_size):
-            mask = (batch == i)
-            num_nodes = mask.sum().item()
-            # CLS 토큰을 제외한 노드 임베딩 추출
-            graph_encoded = transformed[i, 1:num_nodes+1]
-            node_embeddings.append(graph_encoded)
-            
-            # 전체 노드에 대해 예측 수행
-            all_predictions = self.predicter(graph_encoded)
-            
-            # 마스크된 위치의 예측값만 선택
-            if mask_positions is not None:
-                current_mask_positions = mask_positions[i, 1:num_nodes+1]
-                if current_mask_positions.any():
-                    masked_predictions = all_predictions[current_mask_positions]
-                    masked_outputs.append(masked_predictions)
+            # 각 노드에 대한 context 선택
+            for node_idx in range(num_nodes):
+                # Context sampling
+                context_scores = intimacy_matrix[node_idx]
+                _, context_indices = torch.topk(context_scores, k=min(5, num_nodes-1))
+                subgraph_nodes = torch.cat([torch.tensor([node_idx], device=device), context_indices])
+                
+                # Feature embeddings
+                subgraph_x = current_x[subgraph_nodes]
+                raw_embed = self.raw_embeddings(subgraph_x)
+                
+                # Positional embeddings
+                pos_ids = torch.arange(len(subgraph_nodes), device=device)
+                pos_embed = self.pos_embeddings(pos_ids)
+                
+                # WL role embeddings
+                subgraph_wl = wl_codes[subgraph_nodes.long()]  # subgraph_nodes를 long 타입으로 변환
+                wl_embed = self.wl_embeddings(subgraph_wl.long())  # wl_codes도 long 타입으로 변환
+                
+                # Distance embeddings (using attention scores as proxy)
+                dist_scores = intimacy_matrix[node_idx, subgraph_nodes]
+                hop_ids = (1 / dist_scores * 5).long().clamp(0, self.max_nodes-1)
+                hop_embed = self.hop_embeddings(hop_ids)
+                
+                # Combine embeddings
+                node_embeddings = raw_embed + pos_embed + wl_embed + hop_embed
+                node_embeddings = self.layer_norm(node_embeddings)
+                node_embeddings = self.dropout(node_embeddings)
+                
+                # Masking
+                if training and mask_indices is not None and mask_indices[start_idx + node_idx]:
+                    node_embeddings[0] = self.mask_token
+                
+                z_list.append(node_embeddings)
+                subgraphs.append((node_idx, subgraph_nodes))
             
             start_idx += num_nodes
         
-        node_embeddings = torch.cat(node_embeddings, dim=0)
-        
-        # 전체 예측값과 마스크된 위치의 예측값 반환
-        if mask_positions is not None and masked_outputs:
-            return node_embeddings, torch.cat(masked_outputs, dim=0)
-        return node_embeddings, None
+        # Transformer encoding with graph residual
+        batch_size = len(z_list)
+        max_size = max(z.size(0) for z in z_list)
+        padded_z = torch.zeros(batch_size, max_size, self.hidden_dims[-1], device=device)
+        attention_mask = torch.ones(batch_size, max_size, device=device).bool()
 
-    def _init_weights(self, module):
-        if isinstance(module, nn.Linear):
-            nn.init.xavier_uniform_(module.weight)
-            if module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, nn.Parameter):
-            nn.init.normal_(module, mean=0, std=0.02)
-        elif isinstance(module, nn.LayerNorm):
-            nn.init.constant_(module.weight, 1)
-            nn.init.zeros_(module.bias)
-    
+        # Residual mapping 생성
+        residual_mapped = torch.zeros_like(padded_z)
+        start_idx = 0
+        for i, z in enumerate(z_list):
+            size = z.size(0)
+            padded_z[i, :size] = z
+            attention_mask[i, :size] = False
+            
+            # 현재 subgraph의 residual 매핑
+            mask = (batch == i)
+            node_indices = torch.where(mask)[0]
+            
+            # 크기 확인 및 안전한 슬라이싱
+            valid_size = min(size, len(node_indices))
+            if valid_size > 0:
+                residual_mapped[i, :valid_size] = residual[node_indices[:valid_size]]
+            
+            start_idx += size
+        
+
+        # Multi-layer transformer with residual
+        hidden_states = padded_z
+        for layer in self.encoder_layers:
+            # Self-attention with residual
+            attn_output, _ = layer['attention'](
+                hidden_states, hidden_states, hidden_states,
+                key_padding_mask=attention_mask
+            )
+            hidden_states = layer['norm1'](hidden_states + attn_output + residual_mapped)
+            
+            # Feed-forward with residual
+            ff_output = layer['ffn'](hidden_states)
+            hidden_states = layer['norm2'](hidden_states + ff_output + residual_mapped)
+        
+        
+        if training and mask_indices is not None:
+            # Node reconstruction
+            masked_outputs = []
+            for idx, mask in enumerate(mask_indices):
+                if mask:
+                    graph_idx = batch[idx]
+                    node_pos = idx - (batch < graph_idx).sum()
+                    masked_outputs.append(self.node_predictor(hidden_states[node_pos, 0]))
+            
+            masked_outputs = torch.stack(masked_outputs) if masked_outputs else None
+            
+            # Structure prediction with improved loss
+            structure_outputs = self.structure_predictor(hidden_states[:, 0])
+            
+            return hidden_states, masked_outputs, structure_outputs
+        
+        return hidden_states[:, 0]
+        
 
 #%%
 class BatchUtils:
@@ -1257,57 +1119,6 @@ class BatchUtils:
         
         return z_with_cls_batch, mask
 
-
-class GraphBertPositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_nodes):
-        super().__init__()
-        self.d_model = d_model
-        self.max_nodes = max_nodes
-        
-        self.wsp_encoder = nn.Linear(max_nodes, d_model // 2)
-        self.le_encoder = nn.Linear(max_nodes, d_model // 2)
-        
-    def get_wsp_encoding(self, edge_index, num_nodes):
-        edge_index_np = edge_index.cpu().numpy()
-        G = nx.Graph()
-        G.add_nodes_from(range(num_nodes))
-        G.add_edges_from(zip(edge_index_np[0], edge_index_np[1]))
-        
-        spl_matrix = torch.zeros((num_nodes, self.max_nodes))
-        for i in range(num_nodes):
-            for j in range(num_nodes):
-                if i != j:
-                    try:
-                        path_length = nx.shortest_path_length(G, source=i, target=j)
-                    except nx.NetworkXNoPath:
-                        path_length = self.max_nodes
-                    if j < self.max_nodes:
-                        spl_matrix[i, j] = path_length
-                        
-        return spl_matrix.to(edge_index.device)
-    
-    def get_laplacian_encoding(self, edge_index, num_nodes):
-        edge_index, edge_weight = get_laplacian(edge_index, normalization='sym', num_nodes=num_nodes)
-        L = torch.sparse_coo_tensor(edge_index, edge_weight, (num_nodes, num_nodes)).to_dense()
-        
-        L_np = L.cpu().numpy()
-        _, eigenvecs = eigh(L_np)
-        le_matrix = torch.from_numpy(eigenvecs).float().to(edge_index.device)
-        
-        padded_le = torch.zeros((num_nodes, self.max_nodes), device=edge_index.device)
-        padded_le[:, :num_nodes] = le_matrix
-        
-        return padded_le
-    
-    def forward(self, edge_index, num_nodes):
-        wsp_matrix = self.get_wsp_encoding(edge_index, num_nodes)
-        wsp_encoding = self.wsp_encoder(wsp_matrix)
-        
-        le_matrix = self.get_laplacian_encoding(edge_index, num_nodes)
-        le_encoding = self.le_encoder(le_matrix)
-        
-        return torch.cat([wsp_encoding, le_encoding], dim=-1)
-    
 
 class TransformerEncoder(nn.Module):
     def __init__(self, d_model, nhead, num_layers, dim_feedforward, max_nodes, dropout=0.1):
@@ -1373,7 +1184,7 @@ def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
 class GRAPH_AUTOENCODER(nn.Module):
     def __init__(self, num_features, hidden_dims, max_nodes, nhead_BERT, nhead, num_layers_BERT, num_layers, dropout_rate=0.1):
         super().__init__()
-        self.encoder = BertEncoder(
+        self.encoder = GraphBertEncoder(
             num_features=num_features,
             hidden_dims=hidden_dims,
             d_model=hidden_dims[-1],
@@ -1396,50 +1207,51 @@ class GRAPH_AUTOENCODER(nn.Module):
             nn.ReLU(),
             nn.Linear(hidden_dims[-1], hidden_dims[-1])
         )
-        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))
-        
-        # 통합된 구조 통계량 예측기
+        self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))        
         self.stats_predictor = nn.Sequential(
-            nn.Linear(hidden_dims[-1], 2) 
+            nn.Linear(hidden_dims[-1], 2)
         )
-
-    def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, training=False, edge_training=False):
-        # BERT 인코딩
-        if training:
-            if edge_training:
-                z, adj_recon_list = self.encoder(x, edge_index, batch, num_graphs, mask_indices, training=True, edge_training=True)
-            else:
-                z, masked_outputs = self.encoder(x, edge_index, batch, num_graphs, mask_indices, training=True, edge_training=False)
+        
+    def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, is_pretrain=False):
+        # Pre-training phase (마스크 토큰 재구성 + 구조 복원)
+        if is_pretrain:
+            transformed, masked_outputs, structure_outputs = self.encoder(
+                x, edge_index, batch, num_graphs,
+                mask_indices=mask_indices,
+                training=True
+            )
+            return transformed, masked_outputs, structure_outputs
+        
+        # Fine-tuning phase (이상 탐지)
         else:
-            z = self.encoder(x, edge_index, batch, num_graphs, training=False, edge_training=False)
-        
-        # 배치 처리
-        z_list, edge_index_list, max_nodes_in_batch = BatchUtils.process_batch(z, edge_index, batch, num_graphs)
-        z_with_cls_batch, mask = BatchUtils.add_cls_token(
-            z_list, self.cls_token, max_nodes_in_batch, x.device
-        )
-        
-        # Transformer 처리 - 수정된 부분
-        encoded = self.transformer_d(z_with_cls_batch, mask)  # edge_index_list 제거
-        
-        # 출력 처리
-        cls_output = encoded[:, 0, :]
-        node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
-        u = torch.cat(node_outputs, dim=0)
-        
-        # CLS 토큰으로부터 통계량 예측
-        stats_pred = self.stats_predictor(cls_output)
-
-        # 디코딩
-        u_prime = self.u_mlp(u)
-        x_recon = self.feature_decoder(u_prime)
-        
-        if training:
-            if edge_training:
-                return cls_output, x_recon, adj_recon_list
-            else:
-                return cls_output, x_recon, masked_outputs
-        return cls_output, x_recon, stats_pred
+            # Regular forward pass
+            transformed = self.encoder(
+                x, edge_index, batch, num_graphs,
+                training=False
+            )
+            
+            # 배치 처리
+            z_list, edge_index_list, max_nodes_in_batch = BatchUtils.process_batch(transformed, edge_index, batch, num_graphs)
+            z_with_cls_batch, mask = BatchUtils.add_cls_token(
+                z_list, self.cls_token, max_nodes_in_batch, x.device
+            )
+            
+            # Transformer 처리
+            encoded = self.transformer_d(z_with_cls_batch, mask)
+            
+            # 출력 처리
+            cls_output = encoded[:, 0, :]
+            node_outputs = [encoded[i, 1:z_list[i].size(0)+1, :] for i in range(num_graphs)]
+            u = torch.cat(node_outputs, dim=0)
+            
+            # 통계량 예측
+            stats_pred = self.stats_predictor(cls_output)
+            
+            # 디코딩
+            u_prime = self.u_mlp(u)
+            x_recon = self.feature_decoder(u_prime)
+            
+            return cls_output, x_recon, stats_pred
     
 
 #%%
@@ -1482,7 +1294,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     max_node_label = meta['max_node_label']
     
     # BERT 모델 저장 경로
-    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_try10.pth'
+    bert_save_path = f'/home1/rldnjs16/graph_anomaly_detection/BERT_model/Class/all_pretrained_bert_{dataset_name}_fold{trial}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_try20.pth'
     
     model = GRAPH_AUTOENCODER(
         num_features=num_features, 
@@ -1516,13 +1328,13 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
         bert_optimizer = torch.optim.Adam(pretrain_params, lr=learning_rate)
         
         for epoch in range(1, BERT_epochs+1):
-            train_loss, num_sample = train_bert_embedding(
+            train_loss, num_sample = pretrain_graph_bert(
                 model, train_loader, bert_optimizer, device
             )
             
             if epoch % log_interval == 0:
                 print(f'BERT Training Epoch {epoch}: Loss = {train_loss:.4f}')
-        
+                
         # 학습된 BERT 저장
         print("Saving pretrained BERT...")
         torch.save(model.encoder.state_dict(), bert_save_path)
@@ -1533,7 +1345,7 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     
     for epoch in range(1, epochs+1):
         fold_start = time.time()  # 현재 폴드 시작 시간
-        train_loss, num_sample, train_cls_outputs, train_errors = train(model, train_loader, recon_optimizer, device, epoch, dataset_name)
+        train_loss, num_sample, train_cls_outputs, train_errors = train(model, train_loader, recon_optimizer, device, epoch)
         
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
@@ -1547,26 +1359,8 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
             print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
             print(f"silhouette_score: {clustering_metrics['silhouette_score']:.4f}")
             
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data, bandwidths_results, compare_bandwidths_result = evaluate_model_with_density(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, epoch, trial, train_errors, device, dataset_name)
-            
-            for bw, metrics in bandwidths_results.items():
-                print(f"\nBandwidth = {bw}")
-                print("-" * 50)
-                print(f"AUROC: {metrics['auroc']:.3f}")
-                print(f"Normal scores:")
-                print(f"  - Mean: {metrics['normal_mean']:.3f}")
-                print(f"  - Std:  {metrics['normal_std']:.3f}")
-                print(f"Anomaly scores:")
-                print(f"  - Mean: {metrics['anomaly_mean']:.3f}")
-                print(f"  - Std:  {metrics['anomaly_std']:.3f}")
-                
-                # 정상과 이상 스코어 간의 분리도 계산
-                separation = (metrics['anomaly_mean'] - metrics['normal_mean']) / \
-                            (metrics['normal_std'] + metrics['anomaly_std'])
-                print(f"Score separation: {separation:.3f}")
-            
-            print_best_results(compare_bandwidths_result)
-                
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device)
+                                                                                                                                                    
             plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time)
 
             save_path_ = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/json/{dataset_name}_time_{current_time}/'
