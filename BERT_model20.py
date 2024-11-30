@@ -133,7 +133,7 @@ def pretrain_graph_bert(model, train_loader, optimizer, device):
     return (total_recon_loss + total_struct_loss) / num_samples, num_samples
 
 
-def train(model, train_loader, recon_optimizer, device, epoch):
+def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=None):
     model.train()
     total_loss = 0
     num_sample = 0
@@ -197,7 +197,7 @@ def train(model, train_loader, recon_optimizer, device, epoch):
         recon_optimizer.step()
         total_loss += loss.item()
 
-    return total_loss / len(train_loader), num_sample, train_cls_outputs.detach().cpu(), reconstruction_errors
+    return total_loss / len(train_loader), num_sample, cluster_centers, reconstruction_errors
 
 
 #%%
@@ -682,11 +682,11 @@ parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
-parser.add_argument("--n-head-BERT", type=int, default=2)
-parser.add_argument("--n-layer-BERT", type=int, default=2)
-parser.add_argument("--n-head", type=int, default=2)
-parser.add_argument("--n-layer", type=int, default=2)
-parser.add_argument("--BERT-epochs", type=int, default=100)
+parser.add_argument("--n-head-BERT", type=int, default=8)
+parser.add_argument("--n-layer-BERT", type=int, default=8)
+parser.add_argument("--n-head", type=int, default=4)
+parser.add_argument("--n-layer", type=int, default=4)
+parser.add_argument("--BERT-epochs", type=int, default=30)
 parser.add_argument("--epochs", type=int, default=300)
 parser.add_argument("--patience", type=int, default=5)
 parser.add_argument("--n-cluster", type=int, default=1)
@@ -1192,51 +1192,6 @@ class TransformerEncoder(nn.Module):
     def forward(self, src, src_key_padding_mask):
         output = self.transformer_encoder(src, src_key_padding_mask=src_key_padding_mask)
         return output
-    
-
-#%%
-class ClusteringAnalyzer:
-    def __init__(self, n_clusters, random_seed):
-        self.n_clusters = n_clusters
-        self.random_seed = random_seed
-        
-    def perform_clustering_with_analysis(self, train_cls_outputs, epoch):
-        """
-        K-means 클러스터링 수행 및 분석을 위한 통합 함수
-        """
-        # CPU로 이동 및 Numpy 배열로 변환
-        cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-        
-        # k-평균 클러스터링 수행
-        kmeans = KMeans(n_clusters=self.n_clusters, random_state=self.random_seed)
-        cluster_labels = kmeans.fit_predict(cls_outputs_np)
-        
-        # Silhouette Score 계산
-        if len(np.unique(cluster_labels)) > 1:  # 클러스터가 2개 이상일 때만 계산
-            sil_score = silhouette_score(cls_outputs_np, cluster_labels)
-            sample_silhouette_values = silhouette_samples(cls_outputs_np, cluster_labels)
-        else:
-            sil_score = 0
-            sample_silhouette_values = np.zeros(len(cluster_labels))
-        
-        cluster_centers = kmeans.cluster_centers_
-        
-        clustering_metrics = {
-            'silhouette_score': sil_score,
-            'sample_silhouette_values': sample_silhouette_values.tolist(),
-            'cluster_sizes': [sum(cluster_labels == i) for i in range(self.n_clusters)],
-            'n_clusters': self.n_clusters
-        }
-        
-        return cluster_centers, clustering_metrics
-    
-
-def perform_clustering(train_cls_outputs, random_seed, n_clusters, epoch):
-    analyzer = ClusteringAnalyzer(n_clusters, random_seed)
-    cluster_centers, clustering_metrics = analyzer.perform_clustering_with_analysis(
-        train_cls_outputs, epoch)
-    
-    return cluster_centers, clustering_metrics
 
             
 #%%
@@ -1405,21 +1360,13 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     
     for epoch in range(1, epochs+1):
         fold_start = time.time()  # 현재 폴드 시작 시간
-        train_loss, num_sample, train_cls_outputs, train_errors = train(model, train_loader, recon_optimizer, device, epoch)
+        train_loss, num_sample, train_cluster_centers, train_errors = train(model, train_loader, recon_optimizer, device, epoch)
         
         info_train = 'Epoch {:3d}, Loss {:.4f}'.format(epoch, train_loss)
 
         if epoch % log_interval == 0:
-            cluster_centers, clustering_metrics = perform_clustering(
-                train_cls_outputs, random_seed, n_clusters=n_cluster, 
-                epoch=epoch
-            )
-
-            print(f"\nClustering Analysis Results (Epoch {epoch}):")
-            print(f"cluster_sizes: {clustering_metrics['cluster_sizes']}")
-            print(f"silhouette_score: {clustering_metrics['silhouette_score']:.4f}")
-            
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device)
+                        
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, train_cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device)
                                                                                                                                                     
             plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time)
 
