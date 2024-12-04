@@ -1245,99 +1245,99 @@ def get_ad_dataset_Tox21(dataset_name, batch_size, test_batch_size, need_str_enc
 #     return optimal_bandwidth, cv_scores
 
 
-def split_batch_graphs(data):
-    graphs = []
-    # ptr을 사용하여 각 그래프의 경계를 찾음
-    for i in range(len(data.ptr) - 1):
-        start, end = data.ptr[i].item(), data.ptr[i + 1].item()
-        # 해당 그래프의 노드 특성
-        x = data.x[start:end]
-        # 해당 그래프의 엣지 인덱스 추출 및 조정
-        mask = (data.edge_index[0] >= start) & (data.edge_index[1] < end)
-        edge_index = data.edge_index[:, mask]
-        edge_index = edge_index - start  # 노드 인덱스 조정
-        graphs.append((x, edge_index))
-    return graphs
+# def split_batch_graphs(data):
+#     graphs = []
+#     # ptr을 사용하여 각 그래프의 경계를 찾음
+#     for i in range(len(data.ptr) - 1):
+#         start, end = data.ptr[i].item(), data.ptr[i + 1].item()
+#         # 해당 그래프의 노드 특성
+#         x = data.x[start:end]
+#         # 해당 그래프의 엣지 인덱스 추출 및 조정
+#         mask = (data.edge_index[0] >= start) & (data.edge_index[1] < end)
+#         edge_index = data.edge_index[:, mask]
+#         edge_index = edge_index - start  # 노드 인덱스 조정
+#         graphs.append((x, edge_index))
+#     return graphs
 
 
-def compute_persistence(graph_distance_matrix, dataset_name):
-    """Persistence diagram만 계산하는 최적화된 함수"""
-    try:
-        if not isinstance(graph_distance_matrix, np.ndarray) or graph_distance_matrix.size == 0:
-            return []
+# def compute_persistence(graph_distance_matrix, dataset_name):
+#     """Persistence diagram만 계산하는 최적화된 함수"""
+#     try:
+#         if not isinstance(graph_distance_matrix, np.ndarray) or graph_distance_matrix.size == 0:
+#             return []
             
-        # 더 효율적인 샘플링
-        if graph_distance_matrix.shape[0] > 100:
-            # 균일한 간격으로 샘플링하여 더 대표성 있는 부분집합 선택
-            step = graph_distance_matrix.shape[0] // 100
-            indices = np.arange(0, graph_distance_matrix.shape[0], step)[:100]
-            graph_distance_matrix = graph_distance_matrix[indices][:, indices]
+#         # 더 효율적인 샘플링
+#         if graph_distance_matrix.shape[0] > 100:
+#             # 균일한 간격으로 샘플링하여 더 대표성 있는 부분집합 선택
+#             step = graph_distance_matrix.shape[0] // 100
+#             indices = np.arange(0, graph_distance_matrix.shape[0], step)[:100]
+#             graph_distance_matrix = graph_distance_matrix[indices][:, indices]
         
-        if dataset_name == 'AIDS':
-            max_dimension = 1
-        else:
-            max_dimension = 2
+#         if dataset_name == 'AIDS':
+#             max_dimension = 1
+#         else:
+#             max_dimension = 2
             
-        # 최소한의 차원과 계산만 수행
-        rips = gd.RipsComplex(distance_matrix=graph_distance_matrix)
-        st = rips.create_simplex_tree(max_dimension=max_dimension) 
-        st.persistence()  # 결과 저장 없이 바로 반환
-        persistence = [(dim, (birth, death)) for dim, (birth, death) in st.persistence() 
-                      if death != float('inf')]  # 무한대 값 필터링
+#         # 최소한의 차원과 계산만 수행
+#         rips = gd.RipsComplex(distance_matrix=graph_distance_matrix)
+#         st = rips.create_simplex_tree(max_dimension=max_dimension) 
+#         st.persistence()  # 결과 저장 없이 바로 반환
+#         persistence = [(dim, (birth, death)) for dim, (birth, death) in st.persistence() 
+#                       if death != float('inf')]  # 무한대 값 필터링
         
-        del rips, st
-        return persistence
+#         del rips, st
+#         return persistence
         
-    except Exception as e:
-        print(f"Error in persistence computation: {str(e)}")
-        return []
+#     except Exception as e:
+#         print(f"Error in persistence computation: {str(e)}")
+#         return []
     
 
-def process_batch_graphs(data, dataset_name):
-    try:
-        graphs = split_batch_graphs(data)
-        stats_list = []
+# def process_batch_graphs(data, dataset_name):
+#     try:
+#         graphs = split_batch_graphs(data)
+#         stats_list = []
         
-        for i, (x, _) in enumerate(graphs):
-            try:
-                x_np = x.cpu().detach().numpy()
-                distance_matrix = squareform(pdist(x_np))
-                persistence = compute_persistence(distance_matrix, dataset_name)
+#         for i, (x, _) in enumerate(graphs):
+#             try:
+#                 x_np = x.cpu().detach().numpy()
+#                 distance_matrix = squareform(pdist(x_np))
+#                 persistence = compute_persistence(distance_matrix, dataset_name)
                 
-                if not persistence:
-                    stats_list.append(np.zeros(5, dtype=np.float32))
-                    continue
+#                 if not persistence:
+#                     stats_list.append(np.zeros(5, dtype=np.float32))
+#                     continue
                 
-                # 한 번의 순회로 모든 통계 계산
-                births, deaths = zip(*[birth_death for _, birth_death in persistence])
-                survivals = np.array([d - b for b, d in zip(births, deaths)])
+#                 # 한 번의 순회로 모든 통계 계산
+#                 births, deaths = zip(*[birth_death for _, birth_death in persistence])
+#                 survivals = np.array([d - b for b, d in zip(births, deaths)])
                 
-                stats = np.array([
-                    np.mean(survivals),
-                    np.max(survivals),
-                    np.var(survivals) if len(survivals) > 1 else 0,
-                    np.mean(births),
-                    np.mean(deaths)
-                ], dtype=np.float32)
+#                 stats = np.array([
+#                     np.mean(survivals),
+#                     np.max(survivals),
+#                     np.var(survivals) if len(survivals) > 1 else 0,
+#                     np.mean(births),
+#                     np.mean(deaths)
+#                 ], dtype=np.float32)
                 
-                stats_list.append(stats)
+#                 stats_list.append(stats)
                 
-            except Exception as e:
-                print(f"Error processing graph {i}: {str(e)}")
-                stats_list.append(np.zeros(5, dtype=np.float32))
+#             except Exception as e:
+#                 print(f"Error processing graph {i}: {str(e)}")
+#                 stats_list.append(np.zeros(5, dtype=np.float32))
             
-            # 더 효율적인 메모리 관리
-            if i % 50 == 0:
-                gc.collect()
+#             # 더 효율적인 메모리 관리
+#             if i % 50 == 0:
+#                 gc.collect()
         
-        # 한 번에 텐서로 변환
-        data.true_stats = torch.tensor(stats_list, dtype=torch.float32)
-        return data
+#         # 한 번에 텐서로 변환
+#         data.true_stats = torch.tensor(stats_list, dtype=torch.float32)
+#         return data
         
-    except Exception as e:
-        print(f"Error in process_batch_graphs: {str(e)}")
-        data.true_stats = torch.zeros((len(graphs), 5), dtype=torch.float32)
-        return data
+#     except Exception as e:
+#         print(f"Error in process_batch_graphs: {str(e)}")
+#         data.true_stats = torch.zeros((len(graphs), 5), dtype=torch.float32)
+#         return data
     
     
 def scott_rule_bandwidth(X):
@@ -1374,3 +1374,102 @@ def loocv_bandwidth_selection(X, bandwidths=None, cv=None, range_factor=5):
     optimal_bandwidth = max(cv_scores.items(), key=lambda x: x[1])[0]
     return optimal_bandwidth, cv_scores
 
+
+def split_batch_graphs(data):
+    graphs = []
+    # ptr을 사용하여 각 그래프의 경계를 찾음
+    for i in range(len(data.ptr) - 1):
+        start, end = data.ptr[i].item(), data.ptr[i + 1].item()
+        # 해당 그래프의 노드 특성
+        x = data.x[start:end]
+        # 해당 그래프의 엣지 인덱스 추출 및 조정
+        mask = (data.edge_index[0] >= start) & (data.edge_index[1] < end)
+        edge_index = data.edge_index[:, mask]
+        edge_index = edge_index - start  # 노드 인덱스 조정
+        graphs.append((x, edge_index))
+    return graphs
+
+
+def compute_persistence_and_betti(graph_distance_matrix, max_dimension=2):
+    try:
+        # Rips Complex 생성
+        rips_complex = gd.RipsComplex(distance_matrix=graph_distance_matrix, max_edge_length=2.0)
+        simplex_tree = rips_complex.create_simplex_tree(max_dimension=max_dimension)
+        
+        # Persistent Homology 계산
+        simplex_tree.compute_persistence()
+        
+        # persistence diagram 가져오기
+        persistence_diagram = simplex_tree.persistence()
+        
+        # if persistence_diagram:
+        #     min_val = min(min(birth, death if death != float('inf') else birth) 
+        #                  for _, (birth, death) in persistence_diagram)
+        #     max_val = max(max(birth, death if death != float('inf') else birth) 
+        #                  for _, (birth, death) in persistence_diagram)
+        # else:
+        #     min_val, max_val = 0.0, 2.0
+        
+        # # Betti Numbers 계산
+        # betti_numbers = simplex_tree.persistent_betti_numbers(min_val, max_val)
+        
+        return persistence_diagram
+    except Exception as e:
+        print(f"Error in persistence computation: {str(e)}")
+        return []
+
+
+def process_batch_graphs(data):
+    graphs = split_batch_graphs(data)
+    true_stats_list = []
+    
+    for i, (x, edge_index) in enumerate(graphs):
+        try:
+            # 거리 행렬 계산
+            distance_matrix = squareform(pdist(x.cpu().numpy(), metric='euclidean'))
+            
+            # Persistent Homology 계산
+            persistence_diagram = compute_persistence_and_betti(distance_matrix)
+            
+            # 통계 추출
+            stats = {
+                "mean_survival": np.mean([death - birth for _, (birth, death) in persistence_diagram 
+                                        if death != float('inf')]) if persistence_diagram else 0.0,
+                "max_survival": np.max([death - birth for _, (birth, death) in persistence_diagram 
+                                      if death != float('inf')]) if persistence_diagram else 0.0,
+                "variance_survival": np.var([death - birth for _, (birth, death) in persistence_diagram 
+                                           if death != float('inf')]) if persistence_diagram else 0.0,
+                "mean_birth": np.mean([birth for _, (birth, death) in persistence_diagram]) if persistence_diagram else 0.0,
+                "mean_death": np.mean([death for _, (birth, death) in persistence_diagram 
+                                     if death != float('inf')]) if persistence_diagram else 0.0
+            }
+            
+            true_stats_list.append(stats)
+                
+        except Exception as e:
+            true_stats_list.append({
+                "mean_survival": 0.0, "max_survival": 0.0, "variance_survival": 0.0,
+                "mean_birth": 0.0, "mean_death": 0.0
+            })
+    
+    # 모든 통계를 tensor로 변환
+    true_stats_tensor = torch.tensor([
+        [stats['mean_survival'], stats['max_survival'], stats['variance_survival'],
+         stats['mean_birth'], stats['mean_death']]
+        for stats in true_stats_list
+    ], dtype=torch.float32)
+    
+    # 데이터에 통계 추가
+    data.true_stats = true_stats_tensor
+    
+    # print("\nProcessing completed!")
+    # print(f"Final statistics shape: {data.true_stats.shape}")
+    
+    # 처음 몇 개 그래프의 통계 출력
+    # print("\nFirst few graphs statistics:")
+    # for i in range(min(3, len(true_stats_list))):
+    #     print(f"\nGraph {i}:")
+    #     print(f"Mean survival: {true_stats_list[i]['mean_survival']:.4f}")
+    #     print(f"Max survival: {true_stats_list[i]['max_survival']:.4f}")
+    
+    return data

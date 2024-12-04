@@ -140,14 +140,14 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
     reconstruction_errors = []
     
     for data in train_loader:
-        data = TopER_Embedding(data)
+        # data = TopER_Embedding(data)
         data = data.to(device)
         recon_optimizer.zero_grad()
         x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs
-        toper_target = data.toper_embeddings
+        # toper_target = data.toper_embeddings
         
         # Forward pass - fine-tuning mode
-        train_cls_outputs, x_recon, stats_pred = model(
+        train_cls_outputs, x_recon = model(
             x, edge_index, batch, num_graphs,
             is_pretrain=False
         )
@@ -182,15 +182,15 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             
             start_node = end_node
             
-        stats_loss = persistence_stats_loss(stats_pred, toper_target)
+        # stats_loss = persistence_stats_loss(stats_pred, toper_target)
         
-        alpha_ = 10
-        stats_loss = alpha_ * stats_loss
+        # alpha_ = 10
+        # stats_loss = alpha_ * stats_loss
 
-        loss = node_loss + stats_loss
+        loss = node_loss
         
         print(f'node_loss: {node_loss}')
-        print(f'stats_loss: {stats_loss}')
+        # print(f'stats_loss: {stats_loss}')
         
         num_sample += num_graphs
         loss.backward()
@@ -214,7 +214,7 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
             data = data.to(device)
             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs 
             # Forward pass - evaluation mode
-            e_cls_output, x_recon, stats_pred = model(
+            e_cls_output, x_recon = model(
                 x, edge_index, batch, num_graphs,
                 is_pretrain=False
             )
@@ -682,8 +682,8 @@ parser.add_argument("--dataset-name", type=str, default='COX2')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
-parser.add_argument("--n-head-BERT", type=int, default=8)
-parser.add_argument("--n-layer-BERT", type=int, default=8)
+parser.add_argument("--n-head-BERT", type=int, default=2)
+parser.add_argument("--n-layer-BERT", type=int, default=2)
 parser.add_argument("--n-head", type=int, default=4)
 parser.add_argument("--n-layer", type=int, default=4)
 parser.add_argument("--BERT-epochs", type=int, default=30)
@@ -1223,9 +1223,9 @@ class GRAPH_AUTOENCODER(nn.Module):
             nn.Linear(hidden_dims[-1], hidden_dims[-1])
         )
         self.cls_token = nn.Parameter(torch.randn(1, 1, hidden_dims[-1]))        
-        self.stats_predictor = nn.Sequential(
-            nn.Linear(hidden_dims[-1], 2)
-        )
+        # self.stats_predictor = nn.Sequential(
+        #     nn.Linear(hidden_dims[-1], 2)
+        # )
         
     def forward(self, x, edge_index, batch, num_graphs, mask_indices=None, is_pretrain=False):
         # Pre-training phase (마스크 토큰 재구성 + 구조 복원)
@@ -1260,13 +1260,13 @@ class GRAPH_AUTOENCODER(nn.Module):
             u = torch.cat(node_outputs, dim=0)
             
             # 통계량 예측
-            stats_pred = self.stats_predictor(cls_output)
+            # stats_pred = self.stats_predictor(cls_output)
             
             # 디코딩
             u_prime = self.u_mlp(u)
             x_recon = self.feature_decoder(u_prime)
             
-            return cls_output, x_recon, stats_pred
+            return cls_output, x_recon
     
 
 #%%
@@ -1471,7 +1471,7 @@ if __name__ == '__main__':
     print(f"Total execution time: {total_time:.2f} seconds")
     
     # 모든 결과를 JSON으로 저장
-    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9_2.json'
+    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_try20.json'
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
     with open(results_path, 'w') as f:
         json.dump({

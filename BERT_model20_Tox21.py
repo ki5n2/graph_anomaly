@@ -342,101 +342,101 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
 
 
-def evaluate_model_(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, reconstruction_errors, epoch, device):
-    model.eval()
-    total_loss_ = 0
-    total_loss_anomaly_ = 0
-    all_labels = []
-    all_scores = []
-    reconstruction_errors_test = []  # 새로 추가
+# def evaluate_model_(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, reconstruction_errors, epoch, device):
+#     model.eval()
+#     total_loss_ = 0
+#     total_loss_anomaly_ = 0
+#     all_labels = []
+#     all_scores = []
+#     reconstruction_errors_test = []  # 새로 추가
     
-    with torch.no_grad():
-        for data in test_loader:
-            data = data.to(device)
-            x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs 
-            # Forward pass - evaluation mode
-            e_cls_output, x_recon, stats_pred = model(
-                x, edge_index, batch, num_graphs,
-                is_pretrain=False
-            )
+#     with torch.no_grad():
+#         for data in test_loader:
+#             data = data.to(device)
+#             x, edge_index, batch, num_graphs = data.x, data.edge_index, data.batch, data.num_graphs 
+#             # Forward pass - evaluation mode
+#             e_cls_output, x_recon, stats_pred = model(
+#                 x, edge_index, batch, num_graphs,
+#                 is_pretrain=False
+#             )
             
-            e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
+#             e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
             
-            recon_errors = []
-            start_node = 0
-            for i in range(num_graphs):
-                num_nodes = (batch == i).sum().item()
-                end_node = start_node + num_nodes
+#             recon_errors = []
+#             start_node = 0
+#             for i in range(num_graphs):
+#                 num_nodes = (batch == i).sum().item()
+#                 end_node = start_node + num_nodes
                 
-                # Reconstruction error 계산
-                node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
-                node_loss = node_loss.item() * alpha
+#                 # Reconstruction error 계산
+#                 node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+#                 node_loss = node_loss.item() * alpha
                 
-                cls_vec = e_cls_outputs_np[i].reshape(1, -1)
-                distances = cdist(cls_vec, cluster_centers, metric='euclidean')
-                min_distance = distances.min().item() * gamma
+#                 cls_vec = e_cls_outputs_np[i].reshape(1, -1)
+#                 distances = cdist(cls_vec, cluster_centers, metric='euclidean')
+#                 min_distance = distances.min().item() * gamma
                 
-                # 변환된 값들 저장
-                reconstruction_errors_test.append({
-                    'reconstruction': node_loss,
-                    'clustering': min_distance,
-                    'type': 'test_normal' if data.y[i].item() == 0 else 'test_anomaly'
-                })
+#                 # 변환된 값들 저장
+#                 reconstruction_errors_test.append({
+#                     'reconstruction': node_loss,
+#                     'clustering': min_distance,
+#                     'type': 'test_normal' if data.y[i].item() == 0 else 'test_anomaly'
+#                 })
 
-                # 전체 에러는 변환된 값들의 평균으로 계산
-                recon_error = node_loss + min_distance              
-                recon_errors.append(recon_error)
+#                 # 전체 에러는 변환된 값들의 평균으로 계산
+#                 recon_error = node_loss + min_distance              
+#                 recon_errors.append(recon_error)
                 
-                print(f'test_node_loss: {node_loss}')
-                print(f'test_min_distance: {min_distance}')
+#                 print(f'test_node_loss: {node_loss}')
+#                 print(f'test_min_distance: {min_distance}')
                 
-                if data.y[i].item() == 0:
-                    total_loss_ += recon_error
-                else:
-                    total_loss_anomaly_ += recon_error
+#                 if data.y[i].item() == 0:
+#                     total_loss_ += recon_error
+#                 else:
+#                     total_loss_anomaly_ += recon_error
                     
-                start_node = end_node
+#                 start_node = end_node
             
-            all_scores.extend(recon_errors)
-            all_labels.extend(data.y.cpu().numpy())
+#             all_scores.extend(recon_errors)
+#             all_labels.extend(data.y.cpu().numpy())
     
-    # 시각화를 위한 데이터 변환
-    visualization_data = {
-        'normal': [
-            {'reconstruction': error['reconstruction'], 
-             'clustering': error['clustering']}
-            for error in reconstruction_errors_test if error['type'] == 'test_normal'
-        ],
-        'anomaly': [
-            {'reconstruction': error['reconstruction'], 
-             'clustering': error['clustering']}
-            for error in reconstruction_errors_test if error['type'] == 'test_anomaly'
-        ]
-    }
+#     # 시각화를 위한 데이터 변환
+#     visualization_data = {
+#         'normal': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors_test if error['type'] == 'test_normal'
+#         ],
+#         'anomaly': [
+#             {'reconstruction': error['reconstruction'], 
+#              'clustering': error['clustering']}
+#             for error in reconstruction_errors_test if error['type'] == 'test_anomaly'
+#         ]
+#     }
     
-    # 메트릭 계산
-    all_labels = np.array(all_labels)
-    all_scores = np.array(all_scores)
+#     # 메트릭 계산
+#     all_labels = np.array(all_labels)
+#     all_scores = np.array(all_scores)
     
-    # 성능 메트릭 계산
-    fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
-    auroc = auc(fpr, tpr)
-    precision, recall, _ = precision_recall_curve(all_labels, all_scores)
-    auprc = auc(recall, precision)
+#     # 성능 메트릭 계산
+#     fpr, tpr, thresholds = roc_curve(all_labels, all_scores)
+#     auroc = auc(fpr, tpr)
+#     precision, recall, _ = precision_recall_curve(all_labels, all_scores)
+#     auprc = auc(recall, precision)
     
-    # 최적 임계값 찾기
-    optimal_idx = np.argmax(tpr - fpr)
-    optimal_threshold = thresholds[optimal_idx]
-    pred_labels = (all_scores > optimal_threshold).astype(int)
+#     # 최적 임계값 찾기
+#     optimal_idx = np.argmax(tpr - fpr)
+#     optimal_threshold = thresholds[optimal_idx]
+#     pred_labels = (all_scores > optimal_threshold).astype(int)
     
-    precision = precision_score(all_labels, pred_labels)
-    recall = recall_score(all_labels, pred_labels)
-    f1 = f1_score(all_labels, pred_labels)
+#     precision = precision_score(all_labels, pred_labels)
+#     recall = recall_score(all_labels, pred_labels)
+#     f1 = f1_score(all_labels, pred_labels)
     
-    total_loss_mean = total_loss_ / sum(all_labels == 0)
-    total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
+#     total_loss_mean = total_loss_ / sum(all_labels == 0)
+#     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
     
-    return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
+#     return auroc, auprc, precision, recall, f1, total_loss_mean, total_loss_anomaly_mean, all_scores, all_labels, reconstruction_errors_test, visualization_data
 
 
 #%%
@@ -763,8 +763,8 @@ parser.add_argument("--dataset-name", type=str, default='Tox21_p53')
 parser.add_argument("--data-root", type=str, default='./dataset')
 parser.add_argument("--assets-root", type=str, default="./assets")
 
-parser.add_argument("--n-head-BERT", type=int, default=8)
-parser.add_argument("--n-layer-BERT", type=int, default=8)
+parser.add_argument("--n-head-BERT", type=int, default=2)
+parser.add_argument("--n-layer-BERT", type=int, default=2)
 parser.add_argument("--n-head", type=int, default=4)
 parser.add_argument("--n-layer", type=int, default=4)
 parser.add_argument("--BERT-epochs", type=int, default=30)
@@ -1451,10 +1451,7 @@ def run(dataset_name, random_seed, device=device, epoch_results=None):
 
             print(f"\nClustering Analysis Results (Epoch {epoch}):")
             
-            if eval_density == True:
-                auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, train_cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device)
-            else:
-                auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model_(model, test_loader, train_cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device) 
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, train_cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, device)
                 
             plot_error_distribution(train_errors, test_errors, epoch, dataset_name, current_time)
 
@@ -1545,7 +1542,7 @@ if __name__ == '__main__':
     print('[FINAL RESULTS] ' + results)
     
     # 모든 결과를 JSON으로 저장
-    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_gcnall{hidden_dims[-1]}_try9_2.json'
+    results_path = f'/home1/rldnjs16/graph_anomaly_detection/cross_val_results/all_pretrained_bert_{dataset_name}_time_{current_time}_nhead{n_head_BERT}_seed{random_seed}_BERT_epochs{BERT_epochs}_try20.json'
     os.makedirs(os.path.dirname(results_path), exist_ok=True)
     with open(results_path, 'w') as f:
         json.dump({
