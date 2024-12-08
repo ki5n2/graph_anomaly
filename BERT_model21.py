@@ -180,13 +180,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
             x, edge_index, batch, num_graphs, is_pretrain=False
         )
-        
-        if epoch % 5 == 0:
-            cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
-            kmeans.fit(cls_outputs_np)
-            cluster_centers = kmeans.cluster_centers_
-            
+                    
         loss = 0
         node_loss = 0
         edge_loss = 0
@@ -199,6 +193,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
                 node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2
             else:
                 node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+            
             node_loss += node_loss_
             
             # 엣지 재구성 손실 (이상 탐지 모델의 decoder 사용)
@@ -218,21 +213,6 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
             ) / node_mask.sum()
             
             edge_loss += edge_loss_
-            
-            if epoch % 5 == 0:
-                node_loss_scaled = node_loss_.item() * alpha
-                cls_vec = train_cls_outputs[i].detach().cpu().numpy()
-                distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-                min_distance = distances.min().item() * gamma
-                
-                edge_loss__ = edge_loss_.item() * beta    
-                
-                reconstruction_errors.append({
-                    'reconstruction': node_loss_scaled + edge_loss__,
-                    'clustering': min_distance,
-                    'type': 'train_normal'  # 훈련 데이터는 모두 정상
-                })
-            
             start_node = end_node
             
         stats_loss = persistence_stats_loss(stats_pred, true_stats)
@@ -254,6 +234,68 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         recon_optimizer.step()
         total_loss += loss.item()
         
+    # 모델 업데이트 완료 후 산점도 데이터 수집
+    model.eval()  # 평가 모드로 전환
+    with torch.no_grad():
+        for data in train_loader:
+            data = process_batch_graphs(data)
+            data = data.to(device)
+            x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
+            
+            # Forward pass
+            train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
+                x, edge_index, batch, num_graphs, is_pretrain=False
+            )
+            
+            # 산점도 데이터 수집
+            if epoch % 5 == 0:
+                cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
+                kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
+                kmeans.fit(cls_outputs_np)
+                cluster_centers = kmeans.cluster_centers_
+                
+                start_node = 0
+                for i in range(num_graphs):
+                    num_nodes = (batch == i).sum().item()
+                    end_node = start_node + num_nodes
+
+                    if dataset_name == 'AIDS':
+                        node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2
+                    else:
+                        node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+                    
+                    node_loss_scaled = node_loss_.item() * alpha
+                    
+                    # 클러스터링 거리 계산
+                    cls_vec = train_cls_outputs[i].detach().cpu().numpy()
+                    distances = cdist([cls_vec], cluster_centers, metric='euclidean')
+                    min_distance = distances.min().item() * gamma
+                    
+                    # 엣지 재구성 오류 계산
+                    graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
+                    graph_edges = graph_edges - start_node
+                    true_adj = torch.zeros((model.edge_recon.max_nodes, 
+                                          model.edge_recon.max_nodes), 
+                                         device=device)
+                    true_adj[graph_edges[0], graph_edges[1]] = 1
+                    true_adj = true_adj + true_adj.t()
+                    true_adj = (true_adj > 0).float()
+                    
+                    node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
+                    node_mask[:num_nodes, :num_nodes] = True
+                    edge_loss_ = torch.sum(
+                        (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
+                    ) / node_mask.sum()
+                    edge_loss__ = edge_loss_.item() * beta
+                    
+                    reconstruction_errors.append({
+                        'reconstruction': node_loss_scaled + edge_loss__,
+                        'clustering': min_distance,
+                        'type': 'train_normal'
+                    })
+                    
+                    start_node = end_node
+
     if epoch % 5 == 0:
         # Create figure with two subplots
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
@@ -282,7 +324,8 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
         plt.close()
-        
+
+    model.train()  # 다시 훈련 모드로 전환
     return total_loss / len(train_loader), num_sample, cluster_centers, reconstruction_errors
 
 
@@ -633,7 +676,7 @@ class DensityBasedScoring:
 
 # Loss 함수 정의
 def persistence_stats_loss(pred_stats, true_stats):
-    continuous_loss = F.mse_loss(pred_stats[:, :5], true_stats[:, :5])
+    continuous_loss = F.mse_loss(pred_stats, true_stats)
     
     return continuous_loss
 

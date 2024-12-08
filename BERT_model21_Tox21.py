@@ -177,12 +177,6 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             x, edge_index, batch, num_graphs, is_pretrain=False
         )
         
-        if epoch % 5 == 0:
-            cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
-            kmeans.fit(cls_outputs_np)
-            cluster_centers = kmeans.cluster_centers_
-            
         loss = 0
         node_loss = 0
         edge_loss = 0
@@ -190,8 +184,8 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
         for i in range(num_graphs):
             num_nodes = (batch == i).sum().item()
             end_node = start_node + num_nodes
-
-            node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+            
+            node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2
             node_loss += node_loss_
             
             # 엣지 재구성 손실 (이상 탐지 모델의 decoder 사용)
@@ -209,22 +203,8 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             edge_loss_ = torch.sum(
                 (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
             ) / node_mask.sum()
+
             edge_loss += edge_loss_
-            
-            if epoch % 5 == 0:
-                node_loss_scaled = node_loss_.item() * alpha
-                cls_vec = train_cls_outputs[i].detach().cpu().numpy()
-                distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-                min_distance = distances.min().item() * gamma
-                
-                edge_loss__ = edge_loss_.item() * beta  
-                
-                reconstruction_errors.append({
-                    'reconstruction': node_loss_scaled + edge_loss__,
-                    'clustering': min_distance,
-                    'type': 'train_normal'  # 훈련 데이터는 모두 정상
-                })
-            
             start_node = end_node
             
         stats_loss = persistence_stats_loss(stats_pred, true_stats)
@@ -245,7 +225,99 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
         loss.backward()
         recon_optimizer.step()
         total_loss += loss.item()
+    
+    # 모델 업데이트 완료 후 산점도 데이터 수집
+    model.eval()  # 평가 모드로 전환
+    with torch.no_grad():
+        for data in train_loader:
+            data = process_batch_graphs(data)
+            data = data.to(device)
+            x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
+            
+            # Forward pass
+            train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
+                x, edge_index, batch, num_graphs, is_pretrain=False
+            )
+            
+            # 산점도 데이터 수집
+            if epoch % 5 == 0:
+                cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
+                kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
+                kmeans.fit(cls_outputs_np)
+                cluster_centers = kmeans.cluster_centers_
+                
+                start_node = 0
+                for i in range(num_graphs):
+                    num_nodes = (batch == i).sum().item()
+                    end_node = start_node + num_nodes
 
+                    if dataset_name == 'AIDS':
+                        node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2
+                    else:
+                        node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+                    
+                    node_loss_scaled = node_loss_.item() * alpha
+                    
+                    # 클러스터링 거리 계산
+                    cls_vec = train_cls_outputs[i].detach().cpu().numpy()
+                    distances = cdist([cls_vec], cluster_centers, metric='euclidean')
+                    min_distance = distances.min().item() * gamma
+                    
+                    # 엣지 재구성 오류 계산
+                    graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
+                    graph_edges = graph_edges - start_node
+                    true_adj = torch.zeros((model.edge_recon.max_nodes, 
+                                          model.edge_recon.max_nodes), 
+                                         device=device)
+                    true_adj[graph_edges[0], graph_edges[1]] = 1
+                    true_adj = true_adj + true_adj.t()
+                    true_adj = (true_adj > 0).float()
+                    
+                    node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
+                    node_mask[:num_nodes, :num_nodes] = True
+                    edge_loss_ = torch.sum(
+                        (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
+                    ) / node_mask.sum()
+                    edge_loss__ = edge_loss_.item() * beta
+                    
+                    reconstruction_errors.append({
+                        'reconstruction': node_loss_scaled + edge_loss__,
+                        'clustering': min_distance,
+                        'type': 'train_normal'
+                    })
+                    
+                    start_node = end_node
+
+    if epoch % 5 == 0:
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
+        
+        recon_errors = [point['reconstruction'] for point in reconstruction_errors]
+        cluster_errors = [point['clustering'] for point in reconstruction_errors]
+        
+        # Normal scale plot
+        ax1.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
+        ax1.set_xlabel('Reconstruction Error')
+        ax1.set_ylabel('Clustering Distance')
+        ax1.set_title(f'Training Error Distribution (Epoch {epoch})')
+        ax1.grid(True)
+
+        # Log scale plot
+        ax2.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
+        ax2.set_xlabel('Reconstruction Error')
+        ax2.set_ylabel('Clustering Distance')
+        ax2.set_title(f'Training Error Distribution - Log Scale (Epoch {epoch})')
+        ax2.set_xscale('log')
+        ax2.set_yscale('log')
+        ax2.grid(True)
+
+        plt.tight_layout()
+        save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/train_error_distribution_epoch_{epoch}.png'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        plt.close()
+
+    model.train()  # 다시 훈련 모드로 전환
     return total_loss / len(train_loader), num_sample, cluster_centers, reconstruction_errors
 
 
@@ -276,7 +348,7 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
                 end_idx = start_idx + num_nodes
                 
                 # Reconstruction error 계산
-                node_loss = torch.norm(x[start_idx:end_idx] - x_recon[start_idx:end_idx], p='fro')**2 / num_nodes
+                node_loss = torch.norm(x[start_idx:end_idx] - x_recon[start_idx:end_idx], p='fro')**2
                 node_loss = node_loss.item() * alpha
                     
                 # 2. 엣지 재구성 오류
@@ -446,8 +518,8 @@ def plot_error_distribution(train_errors, test_errors, epoch, dataset_name, curr
     ax1.scatter(test_normal_recon, test_normal_cluster, c='green', label='Test (Normal)', alpha=0.6)
     ax1.scatter(test_anomaly_recon, test_anomaly_cluster, c='red', label='Test (Anomaly)', alpha=0.6)
     
-    ax1.set_xlabel('Reconstruction Error (node_loss * alpha)')
-    ax1.set_ylabel('Clustering Distance (min_distance * gamma)')
+    ax1.set_xlabel('Reconstruction Error')
+    ax1.set_ylabel('Clustering Distance')
     ax1.set_title(f'Error Distribution (Epoch {epoch})')
     ax1.legend()
     ax1.grid(True)
@@ -457,8 +529,8 @@ def plot_error_distribution(train_errors, test_errors, epoch, dataset_name, curr
     ax2.scatter(test_normal_recon, test_normal_cluster, c='green', label='Test (Normal)', alpha=0.6)
     ax2.scatter(test_anomaly_recon, test_anomaly_cluster, c='red', label='Test (Anomaly)', alpha=0.6)
     
-    ax2.set_xlabel('Reconstruction Error (node_loss * alpha)')
-    ax2.set_ylabel('Clustering Distance (min_distance * gamma)')
+    ax2.set_xlabel('Reconstruction Error')
+    ax2.set_ylabel('Clustering Distance')
     ax2.set_title(f'Error Distribution - Log Scale (Epoch {epoch})')
     ax2.set_xscale('log')
     ax2.set_yscale('log')
@@ -1003,7 +1075,6 @@ class GraphBertPositionalEncoding(nn.Module):
         le_encoding = self.le_encoder(le_matrix)
         
         return torch.cat([wsp_encoding, le_encoding], dim=-1)
-    
     
     
 #%%

@@ -166,6 +166,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
     num_sample = 0
     reconstruction_errors = []
     
+    # 학습 단계
     for data in train_loader:
         data = process_batch_graphs(data)
         data = data.to(device)
@@ -182,7 +183,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
             kmeans.fit(cls_outputs_np)
             cluster_centers = kmeans.cluster_centers_
-            
+        
         loss = 0
         node_loss = 0
         edge_loss = 0
@@ -193,12 +194,13 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             end_node = start_node + num_nodes
 
             node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+            # stats_loss_ = torch.norm(true_stats[start_node:end_node] - stats_pred[start_node:end_node], p='fro')**2 / num_nodes
+            stats_loss_ = F.mse_loss(stats_pred[start_node:end_node], true_stats[start_node:end_node], reduction='sum') / num_nodes
+                
             node_loss += node_loss_
+            stats_loss += stats_loss_ 
             
-            stats_loss_ = persistence_stats_loss(stats_pred, true_stats) / num_nodes
-            stats_loss += stats_loss_
-            
-            # 엣지 재구성 손실 (이상 탐지 모델의 decoder 사용)
+            # 엣지 재구성 손실
             graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
             graph_edges = graph_edges - start_node
             true_adj = torch.zeros((model.edge_recon.max_nodes, 
@@ -215,29 +217,12 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
             ) / node_mask.sum()
             
             edge_loss += edge_loss_
-            
-            if epoch % 5 == 0:
-                node_loss_scaled = node_loss_.item() * alpha
-                # cls_vec = train_cls_outputs[i].detach().cpu().numpy()
-                # distances = cdist([cls_vec], cluster_centers, metric='euclidean')
-                # min_distance = distances.min().item() * gamma
-                
-                edge_loss__ = edge_loss_.item() * beta  
-                
-                stats_loss_scaled = stats_loss_.item() * gamma
-                
-                reconstruction_errors.append({
-                    'reconstruction': node_loss_scaled + edge_loss__,
-                    'topology': stats_loss_scaled,
-                    'type': 'train_normal'  # 훈련 데이터는 모두 정상
-                })
-            
             start_node = end_node
                     
         beta_ = 0.5   # 엣지 재구성 가중치
         edge_loss = beta_ * edge_loss
         
-        gamma_ = 5.0
+        gamma_ = 10.0
         stats_loss = gamma_ * stats_loss
         
         loss = node_loss + edge_loss + stats_loss
@@ -251,7 +236,90 @@ def train(model, train_loader, recon_optimizer, device, epoch, cluster_centers=N
         recon_optimizer.step()
         total_loss += loss.item()
 
+    # 모델 업데이트 완료 후 산점도 데이터 수집
+    model.eval()  # 평가 모드로 전환
+    with torch.no_grad():
+        for data in train_loader:
+            data = process_batch_graphs(data)
+            data = data.to(device)
+            x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
+            
+            # Forward pass
+            train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
+                x, edge_index, batch, num_graphs, is_pretrain=False
+            )
+            
+            # 산점도 데이터 수집
+            if epoch % 5 == 0:
+                start_node = 0
+                for i in range(num_graphs):
+                    num_nodes = (batch == i).sum().item()
+                    end_node = start_node + num_nodes
+
+                    node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
+                    # stats_loss_ = torch.norm(true_stats[start_node:end_node] - stats_pred[start_node:end_node], p='fro')**2 / num_nodes
+                    stats_loss_ = F.mse_loss(stats_pred[start_node:end_node], true_stats[start_node:end_node], reduction='sum') / num_nodes
+                    
+                    node_loss_scaled = node_loss_.item() * alpha
+                    
+                    graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
+                    graph_edges = graph_edges - start_node
+                    true_adj = torch.zeros((model.edge_recon.max_nodes, 
+                                          model.edge_recon.max_nodes), 
+                                         device=device)
+                    true_adj[graph_edges[0], graph_edges[1]] = 1
+                    true_adj = true_adj + true_adj.t()
+                    true_adj = (true_adj > 0).float()
+                    
+                    node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
+                    node_mask[:num_nodes, :num_nodes] = True
+                    edge_loss_ = torch.sum(
+                        (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
+                    ) / node_mask.sum()
+                    edge_loss__ = edge_loss_.item() * beta
+
+                    stats_loss_scaled = stats_loss_.item() * gamma
+                    
+                    reconstruction_errors.append({
+                        'reconstruction': node_loss_scaled + edge_loss__,
+                        'topology': stats_loss_scaled,
+                        'type': 'train_normal'
+                    })
+                    
+                    start_node = end_node
+
+    if epoch % 5 == 0:
+        # Create figure with two subplots
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
+        
+        recon_errors = [point['reconstruction'] for point in reconstruction_errors]
+        cluster_errors = [point['topology'] for point in reconstruction_errors]
+        
+        # Normal scale plot
+        ax1.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
+        ax1.set_xlabel('Reconstruction Error')
+        ax1.set_ylabel('Topology')
+        ax1.set_title(f'Training Error Distribution (Epoch {epoch})')
+        ax1.grid(True)
+
+        # Log scale plot
+        ax2.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
+        ax2.set_xlabel('Reconstruction Error')
+        ax2.set_ylabel('Topology')
+        ax2.set_title(f'Training Error Distribution - Log Scale (Epoch {epoch})')
+        ax2.set_xscale('log')
+        ax2.set_yscale('log')
+        ax2.grid(True)
+
+        plt.tight_layout()
+        save_path = f'/home1/rldnjs16/graph_anomaly_detection/error_distribution_plot/plot/{dataset_name}_time_{current_time}/train_error_distribution_epoch_{epoch}.png'
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path)
+        plt.close()
+    
+    model.train()  # 다시 훈련 모드로 전환
     return total_loss / len(train_loader), num_sample, cluster_centers, reconstruction_errors
+
 
 
 #%%
@@ -265,6 +333,7 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
     
     with torch.no_grad():
         for data in test_loader:
+            data = process_batch_graphs(data)
             data = data.to(device)
             x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
             # Forward pass - evaluation mode
@@ -284,7 +353,8 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
                 node_loss = torch.norm(x[start_idx:end_idx] - x_recon[start_idx:end_idx], p='fro')**2 / num_nodes
                 node_loss = node_loss.item() * alpha
                     
-                stats_loss = persistence_stats_loss(stats_pred, true_stats) / num_nodes
+                # stats_loss = torch.norm(true_stats[start_idx:end_idx] - stats_pred[start_idx:end_idx], p='fro')**2 / num_nodes
+                stats_loss = F.mse_loss(stats_pred[start_idx:end_idx], true_stats[start_idx:end_idx], reduction='sum') / num_nodes
                 stats_loss = stats_loss.item() * gamma
                 
                 # 2. 엣지 재구성 오류
@@ -597,13 +667,6 @@ class DensityBasedScoring:
         
         return contour
     
-
-# Loss 함수 정의
-def persistence_stats_loss(pred_stats, true_stats):
-    continuous_loss = F.mse_loss(pred_stats[:, :5], true_stats[:, :5])
-    
-    return continuous_loss
-
 
 #%%
 '''ARGPARSER'''
