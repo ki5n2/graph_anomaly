@@ -3,8 +3,6 @@
 # python argparse source for experiments
 experiments=(
 "--dataset-name Tox21_p53 --random-seed 1 --epochs 100 --learning-rate 0.0001"
-"--dataset-name Tox21_MMP --random-seed 1 --epochs 100 --learning-rate 0.0001"
-"--dataset-name Tox21_HSE --random-seed 1 --epochs 100 --learning-rate 0.0001"
 )
 
 # default prefix of job name
@@ -28,9 +26,9 @@ RUN_SRC=./run_src.sh
 ENV=/home1/rldnjs16/ENTER/envs/graph/bin/python3
 
 # file directory of experiment ".py"
-EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model23_Tox21.py
+EXECUTION_FILE=/home1/rldnjs16/graph_anomaly_detection/BERT_model24_Tox21.py
 
 for index in ${!experiments[*]}; do
-    sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[1]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 
+    sbatch --job-name=$DEFAULT_NAME$index ${DEVICES[6]} $RUN_SRC $ENV $EXECUTION_FILE ${experiments[$index]} 
     sleep 1
 done

@@ -164,13 +164,12 @@ def train_bert_edge_reconstruction(model, train_loader, bert_optimizer, device):
 
 
 #%%
-def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, cluster_centers=None):
+def train(model, train_loader, recon_optimizer, device, epoch, dataset_name):
     model.train()
     total_loss = 0
     num_sample = 0
     reconstruction_errors = []
     
-    # 학습 단계
     for data in train_loader:
         data = process_batch_graphs(data)
         data = data.to(device)
@@ -178,20 +177,12 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
         
         # Forward pass
-        train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
+        x_recon, stats_pred = model(
             x, edge_index, batch, num_graphs, is_pretrain=False
         )
         
-        if epoch % 5 == 0:
-            cls_outputs_np = train_cls_outputs.detach().cpu().numpy()
-            kmeans = KMeans(n_clusters=n_cluster, random_state=random_seed)
-            kmeans.fit(cls_outputs_np)
-            cluster_centers = kmeans.cluster_centers_
-        
         loss = 0
         node_loss = 0
-        edge_loss = 0
-        stats_loss = 0
         start_node = 0
         for i in range(num_graphs):
             num_nodes = (batch == i).sum().item()
@@ -202,40 +193,17 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
             else:
                 node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
             
-            stats_loss_ = persistence_stats_loss(stats_pred[i], true_stats[i])
-                
             node_loss += node_loss_
-            stats_loss += stats_loss_ 
-            
-            # 엣지 재구성 손실
-            graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
-            graph_edges = graph_edges - start_node
-            true_adj = torch.zeros((model.edge_recon.max_nodes, 
-                                  model.edge_recon.max_nodes), 
-                                 device=device)
-            true_adj[graph_edges[0], graph_edges[1]] = 1
-            true_adj = true_adj + true_adj.t()
-            true_adj = (true_adj > 0).float()
-            
-            node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
-            node_mask[:num_nodes, :num_nodes] = True
-            edge_loss_ = torch.sum(
-                (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
-            ) / node_mask.sum()
-            
-            edge_loss += edge_loss_
             start_node = end_node
-                    
-        beta_ = 0.5   # 엣지 재구성 가중치
-        edge_loss = beta_ * edge_loss
+            
+        stats_loss = persistence_stats_loss(stats_pred, true_stats)
         
-        gamma_ = 10.0
+        gamma_ = 1
         stats_loss = gamma_ * stats_loss
-        
-        loss = node_loss + edge_loss + stats_loss
+
+        loss = node_loss + stats_loss
         
         print(f'node_loss: {node_loss}')
-        print(f'edge_loss: {edge_loss}')
         print(f'stats_loss: {stats_loss}')
         
         num_sample += num_graphs
@@ -252,7 +220,7 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
             x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
             
             # Forward pass
-            train_cls_outputs, x_recon, stats_pred, adj_recon_list = model(
+            x_recon, stats_pred = model(
                 x, edge_index, batch, num_graphs, is_pretrain=False
             )
             
@@ -268,30 +236,16 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
                     else:
                         node_loss_ = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
                     
-                    stats_loss_ = persistence_stats_loss(stats_pred[i], true_stats[i]) 
-                        
                     node_loss_scaled = node_loss_.item() * alpha
-                    
-                    graph_edges = edge_index[:, (edge_index[0] >= start_node) & (edge_index[0] < end_node)]
-                    graph_edges = graph_edges - start_node
-                    true_adj = torch.zeros((model.edge_recon.max_nodes, 
-                                          model.edge_recon.max_nodes), 
-                                         device=device)
-                    true_adj[graph_edges[0], graph_edges[1]] = 1
-                    true_adj = true_adj + true_adj.t()
-                    true_adj = (true_adj > 0).float()
-                    
-                    node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
-                    node_mask[:num_nodes, :num_nodes] = True
-                    edge_loss_ = torch.sum(
-                        (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
-                    ) / node_mask.sum()
-                    edge_loss__ = edge_loss_.item() * beta
-
-                    stats_loss_scaled = stats_loss_.item() * gamma
+                    stats_loss_scaled = persistence_stats_loss(
+                        # stats_pred[i].unsqueeze(0), 
+                        # true_stats[i].unsqueeze(0)
+                        stats_pred[i], 
+                        true_stats[i]
+                    ).item() * gamma
                     
                     reconstruction_errors.append({
-                        'reconstruction': node_loss_scaled + edge_loss__,
+                        'reconstruction': node_loss_scaled,
                         'topology': stats_loss_scaled,
                         'type': 'train_normal'
                     })
@@ -303,19 +257,19 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 6))
         
         recon_errors = [point['reconstruction'] for point in reconstruction_errors]
-        cluster_errors = [point['topology'] for point in reconstruction_errors]
+        topo_errors = [point['topology'] for point in reconstruction_errors]
         
         # Normal scale plot
-        ax1.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
-        ax1.set_xlabel('Reconstruction Error')
-        ax1.set_ylabel('Topology')
+        ax1.scatter(recon_errors, topo_errors, c='blue', alpha=0.6)
+        ax1.set_xlabel('Node Reconstruction Error')
+        ax1.set_ylabel('Topology Reconstruction Error')
         ax1.set_title(f'Training Error Distribution (Epoch {epoch})')
         ax1.grid(True)
 
         # Log scale plot
-        ax2.scatter(recon_errors, cluster_errors, c='blue', alpha=0.6)
-        ax2.set_xlabel('Reconstruction Error')
-        ax2.set_ylabel('Topology')
+        ax2.scatter(recon_errors, topo_errors, c='blue', alpha=0.6)
+        ax2.set_xlabel('Node Reconstruction Error')
+        ax2.set_ylabel('Topology Reconstruction Error')
         ax2.set_title(f'Training Error Distribution - Log Scale (Epoch {epoch})')
         ax2.set_xscale('log')
         ax2.set_yscale('log')
@@ -326,95 +280,72 @@ def train(model, train_loader, recon_optimizer, device, epoch, dataset_name, clu
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         plt.savefig(save_path)
         plt.close()
-    
+
     model.train()  # 다시 훈련 모드로 전환
-    return total_loss / len(train_loader), num_sample, cluster_centers, reconstruction_errors
+    return total_loss / len(train_loader), num_sample, reconstruction_errors
 
 
 #%%
-def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_clusters, random_seed, reconstruction_errors, epoch, dataset_name, device):
+def evaluate_model(model, test_loader, reconstruction_errors, epoch, dataset_name, device):
     model.eval()
     total_loss_ = 0
     total_loss_anomaly_ = 0
     all_labels = []
     all_scores = []
-    reconstruction_errors_test = []  # 새로 추가
+    reconstruction_errors_test = []
     
     with torch.no_grad():
         for data in test_loader:
             data = process_batch_graphs(data)
             data = data.to(device)
             x, edge_index, batch, num_graphs, true_stats = data.x, data.edge_index, data.batch, data.num_graphs, data.true_stats
+            
             # Forward pass - evaluation mode
-            e_cls_output, x_recon, stats_pred, adj_recon_list = model(
+            x_recon, stats_pred = model(
                 x, edge_index, batch, num_graphs, is_pretrain=False
             )
             
-            e_cls_outputs_np = e_cls_output.detach().cpu().numpy()  # [num_graphs, hidden_dim]
-            
-            recon_errors = []
-            start_idx = 0
+            start_node = 0
             for i in range(num_graphs):
                 num_nodes = (batch == i).sum().item()
-                end_idx = start_idx + num_nodes
+                end_node = start_node + num_nodes
                 
-                # Reconstruction error 계산
+                # 노드 재구성 오류 계산
                 if dataset_name == 'AIDS':
-                    node_loss = torch.norm(x[start_idx:end_idx] - x_recon[start_idx:end_idx], p='fro')**2
+                    node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2
                 else:
-                    node_loss = torch.norm(x[start_idx:end_idx] - x_recon[start_idx:end_idx], p='fro')**2 / num_nodes
-                
-                stats_loss = persistence_stats_loss(stats_pred[i], true_stats[i]) 
+                    node_loss = torch.norm(x[start_node:end_node] - x_recon[start_node:end_node], p='fro')**2 / num_nodes
                     
                 node_loss = node_loss.item() * alpha
-                stats_loss = stats_loss.item() * gamma
                     
-                # 2. 엣지 재구성 오류
-                graph_edges = edge_index[:, (edge_index[0] >= start_idx) & (edge_index[0] < end_idx)]
-                graph_edges = graph_edges - start_idx
-                true_adj = torch.zeros((model.edge_recon.max_nodes, 
-                                      model.edge_recon.max_nodes), 
-                                     device=device)
-                true_adj[graph_edges[0], graph_edges[1]] = 1
-                true_adj = true_adj + true_adj.t()
-                true_adj = (true_adj > 0).float()
-                
-                node_mask = torch.zeros_like(adj_recon_list[i], dtype=torch.bool)
-                node_mask[:num_nodes, :num_nodes] = True
-                edge_loss = torch.sum(
-                    (adj_recon_list[i][node_mask] - true_adj[node_mask]) ** 2
-                ) / node_mask.sum()
-                edge_loss = edge_loss.item() * beta
-                
-                # cls_vec = e_cls_outputs_np[i].reshape(1, -1)
-                # distances = cdist(cls_vec, cluster_centers, metric='euclidean')
-                # min_distance = distances.min().item() * gamma
+                # Persistent homology 재구성 오류 계산
+                stats_loss = persistence_stats_loss(
+                    # stats_pred[i].unsqueeze(0), 
+                    # true_stats[i].unsqueeze(0)
+                    stats_pred[i], 
+                    true_stats[i]
+                ).item() * gamma
 
-                # 전체 에러는 변환된 값들의 평균으로 계산
-                recon_error = node_loss + edge_loss + stats_loss          
+                # 전체 오류 계산
+                total_error = node_loss + stats_loss
                 
-                # 변환된 값들 저장
+                # 결과 저장
                 reconstruction_errors_test.append({
-                    'reconstruction': node_loss + edge_loss,
-                    # 'edge_reconstruction': edge_loss,
+                    'reconstruction': node_loss,
                     'topology': stats_loss,
                     'type': 'test_normal' if data.y[i].item() == 0 else 'test_anomaly'
                 })
                 
                 print(f'test_node_loss: {node_loss}')
-                print(f'test_edge_loss: {edge_loss}')
                 print(f'test_stats_loss: {stats_loss}')
                 
-                recon_errors.append(recon_error)
-                
                 if data.y[i].item() == 0:
-                    total_loss_ += recon_error
+                    total_loss_ += total_error
                 else:
-                    total_loss_anomaly_ += recon_error
+                    total_loss_anomaly_ += total_error
                     
-                start_idx = end_idx
+                start_node = end_node
             
-            all_scores.extend(recon_errors)
             all_labels.extend(data.y.cpu().numpy())
     
     # 시각화를 위한 데이터 변환
@@ -440,11 +371,8 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
                             for error in reconstruction_errors_test if error['type'] == 'test_anomaly'])
     
     # 밀도 기반 스코어링 적용
-    # # Scott의 규칙 적용
-    # bandwidth = scott_rule_bandwidth(train_data)
     bandwidth, _ = loocv_bandwidth_selection(train_data)
     print(f'bandwidth : {bandwidth}')
-    # LOOCV 적용
     density_scorer = DensityBasedScoring(bandwidth=bandwidth)
     density_scorer.fit(train_data)
     
@@ -477,8 +405,8 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
     # 원본 산점도와 밀도 등고선
     contour = density_scorer.plot_density_contours(train_data, test_normal, test_anomaly, ax1)
     fig.colorbar(contour, ax=ax1)
-    ax1.set_xlabel('Reconstruction Error')
-    ax1.set_ylabel('Topology Error')
+    ax1.set_xlabel('Node Reconstruction Error', fontsize=12, fontweight='bold')
+    ax1.set_ylabel('Topology Reconstruction Error', fontsize=12, fontweight='bold')
     ax1.set_title('Density-based Anomaly Detection')
     ax1.legend()
     
@@ -495,20 +423,6 @@ def evaluate_model(model, test_loader, cluster_centers, n_clusters, gamma_cluste
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     plt.savefig(save_path)
     plt.close()
-    
-    # 시각화를 위한 데이터 변환
-    visualization_data = {
-        'normal': [
-            {'reconstruction': error['reconstruction'], 
-             'topology': error['topology']}
-            for error in reconstruction_errors_test if error['type'] == 'test_normal'
-        ],
-        'anomaly': [
-            {'reconstruction': error['reconstruction'], 
-             'topology': error['topology']}
-            for error in reconstruction_errors_test if error['type'] == 'test_anomaly'
-        ]
-    }
     
     total_loss_mean = total_loss_ / sum(all_labels == 0)
     total_loss_anomaly_mean = total_loss_anomaly_ / sum(all_labels == 1)
@@ -719,7 +633,7 @@ parser.add_argument("--learning-rate", type=float, default=0.0001)
 
 parser.add_argument("--alpha", type=float, default=1.0)
 parser.add_argument("--beta", type=float, default=5.0)
-parser.add_argument("--gamma", type=float, default=100.0)
+parser.add_argument("--gamma", type=float, default=10.0)
 parser.add_argument("--gamma-cluster", type=float, default=0.5)
 parser.add_argument("--node-theta", type=float, default=0.03)
 parser.add_argument("--adj-theta", type=float, default=0.01)
@@ -1241,23 +1155,23 @@ class GRAPH_AUTOENCODER(nn.Module):
             u_prime = self.u_mlp(u)
             x_recon = self.feature_decoder(u_prime)
             
-            # 엣지 재구성
-            adj_recon_list = []
-            start_idx = 0
-            for i in range(num_graphs):
-                mask = (batch == i)
-                num_nodes = mask.sum().item()
-                end_idx = start_idx + num_nodes
+            # # 엣지 재구성
+            # adj_recon_list = []
+            # start_idx = 0
+            # for i in range(num_graphs):
+            #     mask = (batch == i)
+            #     num_nodes = mask.sum().item()
+            #     end_idx = start_idx + num_nodes
                 
-                # 현재 그래프의 노드 임베딩 추출
-                current_embeddings = u_prime[start_idx:end_idx]
-                # 엣지 재구성
-                adj_recon = self.edge_recon(current_embeddings)
-                adj_recon_list.append(adj_recon)
+            #     # 현재 그래프의 노드 임베딩 추출
+            #     current_embeddings = u_prime[start_idx:end_idx]
+            #     # 엣지 재구성
+            #     adj_recon = self.edge_recon(current_embeddings)
+            #     adj_recon_list.append(adj_recon)
                 
-                start_idx = end_idx
+            #     start_idx = end_idx
             
-            return cls_output, x_recon, stats_pred, adj_recon_list
+            return x_recon, stats_pred
     
 
 #%%
@@ -1362,7 +1276,8 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
     
     for epoch in range(1, epochs+1):
         fold_start = time.time()  # 현재 폴드 시작 시간
-        train_loss, num_sample, train_cluster_centers, train_errors = train(
+          
+        train_loss, num_sample, train_errors = train(
             model, train_loader, recon_optimizer, device, epoch, dataset_name
         )
         
@@ -1370,8 +1285,8 @@ def run(dataset_name, random_seed, dataset_AN, trial, device=device, epoch_resul
 
         if epoch % log_interval == 0:
                         
-            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, train_cluster_centers, n_cluster, gamma_cluster, random_seed, train_errors, epoch, dataset_name, device)
-                                                                                                                                                    
+            auroc, auprc, precision, recall, f1, test_loss, test_loss_anomaly, all_scores, all_labels, test_errors, visualization_data = evaluate_model(model, test_loader, train_errors, epoch, dataset_name, device)
+            
             plot_error_distribution(train_errors, test_errors, epoch, trial, dataset_name, current_time)
 
             # 결과 저장 디렉토리 생성
