@@ -853,14 +853,14 @@ def get_ad_dataset_Tox21(dataset_name, batch_size, test_batch_size, need_str_enc
     data_ = data_train + data_test
     max_nodes = max([data_[i].num_nodes for i in range(len(data_))])
     
-    train_loader = DataLoader(data_train, batch_size, shuffle=True, num_workers=1, pin_memory=True) # num_workers=4 -> 4개 병렬작업, num_workers=1 -> 단일 작업(시간은 오래 걸리나 안정적일수도)
-    test_loader = DataLoader(data_test, test_batch_size, shuffle=False, pin_memory=True)
+    dataloader = DataLoader(data_train, batch_size, shuffle=True, num_workers=1) # num_workers=4 -> 4개 병렬작업, num_workers=1 -> 단일 작업(시간은 오래 걸리나 안정적일수도)
+    dataloader_test = DataLoader(data_test, test_batch_size, shuffle=True)
     # dataloader_test = DataLoader(data_test, batch_size, shuffle=True)
     # meta = {'num_feat':dataset_num_features, 'num_feat_':dataset_num_features_ ,'num_train':len(data_train), 'max_nodes': max_nodes}
     meta = {'num_feat':dataset_num_features, 'num_train':len(data_train), 'max_nodes': max_nodes}
-    loader_dict = {'train': train_loader, 'test': test_loader}
+    loader_dict = {'train': dataloader, 'test': dataloader_test}
     
-    return {'train': train_loader, 'test': test_loader}, meta
+    return loader_dict, meta
 
 # def compute_persistence_and_betti(graph_distance_matrix, max_dimension=2):
 #     try:
